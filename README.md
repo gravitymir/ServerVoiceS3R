@@ -25,6 +25,24 @@ One TCP connection per utterance:
 
 ## Modes
 
+Selected with the `MODE` env var (default `windows`); `LOOPBACK=1` forces loopback.
+
+### Windows (default — no API keys)
+
+Fully local + your Claude subscription:
+
+- **STT** — Windows `System.Speech` offline recognizer
+- **Reply** — the `claude` CLI (`claude -p`, prompt piped on stdin)
+- **TTS** — Windows SAPI (`System.Speech.Synthesis`), 16 kHz mono
+
+```powershell
+cargo run --release            # MODE defaults to windows
+```
+
+Requires the [`claude` CLI](https://claude.com/claude-code) on `PATH`. Round-trip
+is ~6–10 s. STT accuracy is modest (the built-in recognizer); swap in local
+Whisper later for better transcription.
+
 ### Loopback (no API key)
 
 Echoes the recorded audio straight back — proves the full
@@ -51,8 +69,9 @@ Pipeline: OpenAI **Whisper** (speech-to-text) → **Chat Completions** (reply) �
 
 | Variable         | Default            | Purpose                                   |
 |------------------|--------------------|-------------------------------------------|
-| `OPENAI_API_KEY` | —                  | Required unless `LOOPBACK` is set         |
-| `LOOPBACK`       | unset              | If set, echo audio back (no API calls)    |
+| `MODE`           | `windows`          | `windows` \| `openai` \| `loopback`       |
+| `LOOPBACK`       | unset              | If set, forces loopback mode              |
+| `OPENAI_API_KEY` | —                  | Required for `MODE=openai`                |
 | `PORT`           | `9000`             | TCP listen port                           |
 | `STT_MODEL`      | `whisper-1`        | Transcription model                       |
 | `CHAT_MODEL`     | `gpt-4o-mini`      | Reply model                               |
@@ -89,9 +108,9 @@ New-NetFirewallRule -DisplayName "VoiceS3R 9000" -Direction Inbound -LocalPort 9
 
 ## Roadmap
 
-- Local/offline transcription (whisper.cpp / `faster-whisper`) for a key-free STT
-  path — see the companion experiment in `rust_wthisper`.
-- Optional Claude (Anthropic) for the reply with local STT + local TTS.
+- Better local STT (whisper.cpp / `faster-whisper`) to replace the modest Windows
+  recognizer — see the companion experiment in `rust_wthisper`.
+- Streaming/partial responses to cut the round-trip latency.
 
 ## License
 
