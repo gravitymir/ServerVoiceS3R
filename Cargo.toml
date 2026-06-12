@@ -1,0 +1,15 @@
+[package]
+name = "server_voice_s3r"
+version = "0.1.0"
+edition = "2021"
+description = "PC-side voice-assistant server for the M5Stack ATOM VoiceS3R"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
