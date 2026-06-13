@@ -241,7 +241,7 @@ fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
 
     // Reply (claude CLI, prompt via stdin to avoid quoting issues).
     let t = Instant::now();
-    let reply = run_claude(&voice_prompt(&transcript))?.trim().to_string();
+    let reply = clean_for_speech(&run_claude(&voice_prompt(&transcript))?);
     log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
     if reply.is_empty() {
         return Ok(Response { volume: None, pcm: Vec::new() });
@@ -293,15 +293,41 @@ fn windows_tts(cfg: &Config, text: &str) -> Result<Vec<u8>> {
     Ok(wav_to_pcm(&wav))
 }
 
+/// Strip anything that shouldn't be spoken aloud: a trailing Sources/URL list,
+/// markdown links/emphasis. Web search tends to append citations.
+fn clean_for_speech(text: &str) -> String {
+    let mut s = text.trim().to_string();
+    // Drop a trailing sources/citations section.
+    let lower = s.to_lowercase();
+    for marker in ["\nsources:", "\nsource:", "\nreferences:", "\ncitations:"] {
+        if let Some(i) = lower.find(marker) {
+            s.truncate(i);
+            break;
+        }
+    }
+    // Markdown link [text](url) -> text
+    while let (Some(open), Some(close)) = (s.find("]("), s.find("](").and_then(|i| s[i..].find(')').map(|j| i + j))) {
+        if let Some(lb) = s[..open].rfind('[') {
+            let label = s[lb + 1..open].to_string();
+            s.replace_range(lb..=close, &label);
+        } else {
+            break;
+        }
+    }
+    s.replace('*', "").replace('`', "").replace('#', "").trim().to_string()
+}
+
 /// Shared voice-assistant instruction wrapped around the transcript.
 fn voice_prompt(transcript: &str) -> String {
     format!(
         "You are a warm, concise voice assistant speaking through a small smart speaker. \
          Answer the user's spoken words directly in 1-2 short sentences of plain speech. \
          Reply in the SAME language the user used (Russian or English). \
-         Never mention coding, tasks, tools, or that you are an AI/CLI; never use markdown, \
-         lists, or emojis. If the words are unclear, make a friendly best guess rather than \
-         asking what they meant.\n\nUser said: {transcript}"
+         You may search the web for current info (weather, news, facts) and answer with it, \
+         but speak ONLY the answer: never read out sources, URLs, citations, markdown, \
+         lists, or emojis. Never mention coding, tools, or that you are an AI/CLI. If the \
+         words are unclear, make a friendly best guess rather than asking what they meant.\n\n\
+         User said: {transcript}"
     )
 }
 
@@ -325,7 +351,11 @@ fn run_ps(script: &Path, args: &[&str]) -> Result<String> {
 
 fn run_claude(prompt: &str) -> Result<String> {
     let mut child = Command::new("cmd")
-        .args(["/C", "claude", "-p"])
+        .args([
+            "/C", "claude", "-p",
+            "--tools", "WebSearch",        // make web search available
+            "--allowedTools", "WebSearch", // pre-approve it (headless, no prompt)
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -429,10 +459,10 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     }
 
     let t = Instant::now();
-    let reply = chat(&client, cfg, &transcript)?;
-    log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply.trim()));
+    let reply = clean_for_speech(&chat(&client, cfg, &transcript)?);
+    log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
 
-    let pcm = openai_tts(&client, cfg, reply.trim())?;
+    let pcm = openai_tts(&client, cfg, &reply)?;
     Ok(Response { volume: None, pcm })
 }
 
