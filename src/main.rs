@@ -29,10 +29,15 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 /// A PC command the agent proposed, awaiting the user's spoken yes/no.
 static PENDING_CMD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Control byte sent before the PCM: 0xFF = no change, 0..=100 = set volume,
+/// 0xFE = enter speaker mode (device connects to the pc_speaker stream).
+const CTRL_NONE: u8 = 0xFF;
+const CTRL_SPEAKER: u8 = 0xFE;
+
 /// What to send back to the device.
 struct Response {
-    /// New speaker volume 0..=100, or None to leave it unchanged.
-    volume: Option<u8>,
+    /// Leading control byte (see CTRL_* constants / 0..=100 volume).
+    control: u8,
     /// Response audio (16 kHz mono s16le PCM).
     pcm: Vec<u8>,
 }
@@ -195,7 +200,7 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         "loopback" => {
             log(&format!("[loopback] echoing {} bytes", pcm.len()));
             Response {
-                volume: None,
+                control: CTRL_NONE,
                 pcm: pcm.clone(),
             }
         }
@@ -207,17 +212,18 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         }
     };
 
-    if resp.pcm.is_empty() && resp.volume.is_none() {
+    if resp.pcm.is_empty() && resp.control == CTRL_NONE {
         log("[skip] nothing to send");
         return Ok(());
     }
 
-    // 3. Send: 1 control byte (0xFF = no volume change, else 0..=100) + PCM.
-    let ctrl = resp.volume.unwrap_or(0xFF);
-    if let Some(v) = resp.volume {
-        log(&format!("[volume] -> {v}"));
+    // 3. Send: 1 control byte (0xFF none, 0..=100 volume, 0xFE speaker) + PCM.
+    match resp.control {
+        CTRL_NONE => {}
+        CTRL_SPEAKER => log("[control] -> enter speaker mode"),
+        v => log(&format!("[control] -> volume {v}")),
     }
-    stream.write_all(&[ctrl]).context("writing control header")?;
+    stream.write_all(&[resp.control]).context("writing control header")?;
     if !resp.pcm.is_empty() {
         stream.write_all(&resp.pcm).context("writing response PCM")?;
     }
@@ -235,7 +241,7 @@ fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
     if transcript.is_empty() {
         log("[skip] empty transcript (mic too quiet or not recognized)");
-        return Ok(Response { volume: None, pcm: Vec::new() });
+        return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
     }
 
     // Agent mode: is this a "yes/no" answering a previously proposed action?
@@ -252,11 +258,11 @@ fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
                     (false, true) => "Done.",
                     (false, false) => "That didn't work.",
                 };
-                return Ok(Response { volume: None, pcm: windows_tts(cfg, say)? });
+                return Ok(Response { control: CTRL_NONE, pcm: windows_tts(cfg, say)? });
             } else if is_negative(&transcript) {
                 log("[agent] user declined the action");
                 let say = if ru { "Хорошо, отменяю." } else { "Okay, cancelled." };
-                return Ok(Response { volume: None, pcm: windows_tts(cfg, say)? });
+                return Ok(Response { control: CTRL_NONE, pcm: windows_tts(cfg, say)? });
             }
             // Neither yes nor no: drop the pending action and treat as a new request.
             log("[agent] ambiguous reply, discarding pending action");
@@ -266,7 +272,17 @@ fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     // Voice command: "set volume N" — apply on the device, confirm by speech.
     if let Some(v) = parse_volume(&transcript) {
         let pcm = windows_tts(cfg, &format!("Volume set to {v}."))?;
-        return Ok(Response { volume: Some(v), pcm });
+        return Ok(Response { control: v, pcm });
+    }
+
+    // Voice command: "speaker mode" — tell the device to play the PC audio stream.
+    if is_speaker_cmd(&transcript) {
+        let say = if is_cyrillic(&transcript) {
+            "Включаю режим колонки."
+        } else {
+            "Speaker mode on."
+        };
+        return Ok(Response { control: CTRL_SPEAKER, pcm: windows_tts(cfg, say)? });
     }
 
     // Ask claude either to ANSWER or to PROPOSE a PC command (agent mode), or
@@ -282,22 +298,22 @@ fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
             log(&format!("[agent] proposed command: {cmd}"));
             let ask = if is_cyrillic(&say) { " Сказать да или нет?" } else { " Say yes or no." };
             let speak = format!("{}{}", clean_for_speech(&say), ask);
-            return Ok(Response { volume: None, pcm: windows_tts(cfg, &speak)? });
+            return Ok(Response { control: CTRL_NONE, pcm: windows_tts(cfg, &speak)? });
         }
         // Not an action: speak the answer (from JSON `say`, else the raw text).
         let say = parse_decision(&raw)
             .map(|(_, s, _)| s)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| raw.clone());
-        return Ok(Response { volume: None, pcm: windows_tts(cfg, &clean_for_speech(&say))? });
+        return Ok(Response { control: CTRL_NONE, pcm: windows_tts(cfg, &clean_for_speech(&say))? });
     }
 
     let reply = clean_for_speech(&raw);
     if reply.is_empty() {
-        return Ok(Response { volume: None, pcm: Vec::new() });
+        return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
     }
     let pcm = windows_tts(cfg, &reply)?;
-    Ok(Response { volume: None, pcm })
+    Ok(Response { control: CTRL_NONE, pcm })
 }
 
 /// True if the text contains any Cyrillic letters (used to pick the reply language).
@@ -350,6 +366,16 @@ fn parse_decision(text: &str) -> Option<(bool, String, Option<String>)> {
     Some((action, say, cmd))
 }
 
+/// True if the user asked to enter "speaker mode" (RU/EN).
+fn is_speaker_cmd(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("speaker mode")
+        || t.contains("pc speaker")
+        || t.contains("колонк")
+        || t.contains("динамик")
+        || t.contains("режим колон")
+}
+
 /// Prompt that lets claude either answer or propose a PC command (as JSON).
 fn agent_prompt(transcript: &str) -> String {
     let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
@@ -373,6 +399,7 @@ fn windows_stt(cfg: &Config, pcm: &[u8]) -> Result<String> {
         let client = reqwest::blocking::Client::new();
         let resp = client
             .post(&cfg.stt_url)
+            .timeout(std::time::Duration::from_secs(120))
             .body(pcm.to_vec())
             .send()
             .with_context(|| format!("POST {} — is stt_server.py running?", cfg.stt_url))?;
@@ -566,13 +593,13 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     let transcript = transcribe(&client, cfg, wav)?.trim().to_string();
     log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
     if transcript.is_empty() {
-        return Ok(Response { volume: None, pcm: Vec::new() });
+        return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
     }
 
     // Voice command: "set volume N".
     if let Some(v) = parse_volume(&transcript) {
         let pcm = openai_tts(&client, cfg, &format!("Volume set to {v}."))?;
-        return Ok(Response { volume: Some(v), pcm });
+        return Ok(Response { control: v, pcm });
     }
 
     let t = Instant::now();
@@ -580,7 +607,7 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
 
     let pcm = openai_tts(&client, cfg, &reply)?;
-    Ok(Response { volume: None, pcm })
+    Ok(Response { control: CTRL_NONE, pcm })
 }
 
 /// OpenAI TTS (24 kHz PCM) resampled to the device's 16 kHz.
