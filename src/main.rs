@@ -26,6 +26,9 @@ const TTS_RATE: u32 = 24_000; // OpenAI TTS pcm sample rate
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+/// A PC command the agent proposed, awaiting the user's spoken yes/no.
+static PENDING_CMD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// What to send back to the device.
 struct Response {
     /// New speaker volume 0..=100, or None to leave it unchanged.
@@ -80,6 +83,7 @@ struct Config {
     stt_script: PathBuf,
     tts_script: PathBuf,
     tts_speed: String,
+    agent: bool, // allow voice commands to run PC actions (with spoken confirmation)
     debug_wav: bool,
 }
 
@@ -116,6 +120,7 @@ fn main() -> Result<()> {
         stt_script,
         tts_script,
         tts_speed: env_or("TTS_SPEED", "1.3"), // 1.0 = normal, higher = faster
+        agent: env_or("AGENT", "1") != "0",
         debug_wav: std::env::var("DEBUG_WAV").is_ok(),
     };
 
@@ -233,25 +238,132 @@ fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
         return Ok(Response { volume: None, pcm: Vec::new() });
     }
 
+    // Agent mode: is this a "yes/no" answering a previously proposed action?
+    if cfg.agent {
+        let pending = PENDING_CMD.lock().unwrap().take();
+        if let Some(cmd) = pending {
+            let ru = is_cyrillic(&transcript);
+            if is_affirmative(&transcript) {
+                let ok = run_pc_command(&cmd);
+                log(&format!("[agent] run `{cmd}` -> {}", if ok { "ok" } else { "FAILED" }));
+                let say = match (ru, ok) {
+                    (true, true) => "Готово.",
+                    (true, false) => "Не получилось.",
+                    (false, true) => "Done.",
+                    (false, false) => "That didn't work.",
+                };
+                return Ok(Response { volume: None, pcm: windows_tts(cfg, say)? });
+            } else if is_negative(&transcript) {
+                log("[agent] user declined the action");
+                let say = if ru { "Хорошо, отменяю." } else { "Okay, cancelled." };
+                return Ok(Response { volume: None, pcm: windows_tts(cfg, say)? });
+            }
+            // Neither yes nor no: drop the pending action and treat as a new request.
+            log("[agent] ambiguous reply, discarding pending action");
+        }
+    }
+
     // Voice command: "set volume N" — apply on the device, confirm by speech.
     if let Some(v) = parse_volume(&transcript) {
         let pcm = windows_tts(cfg, &format!("Volume set to {v}."))?;
         return Ok(Response { volume: Some(v), pcm });
     }
 
-    // Reply (claude CLI, prompt via stdin to avoid quoting issues).
+    // Ask claude either to ANSWER or to PROPOSE a PC command (agent mode), or
+    // just to answer (agent off).
     let t = Instant::now();
-    let reply = clean_for_speech(&run_claude(&voice_prompt(&transcript))?);
-    log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
+    let prompt = if cfg.agent { agent_prompt(&transcript) } else { voice_prompt(&transcript) };
+    let raw = run_claude(&prompt)?;
+    log(&format!("[llm {:?}] {}", t.elapsed(), raw.replace('\n', " ").trim()));
+
+    if cfg.agent {
+        if let Some((true, say, Some(cmd))) = parse_decision(&raw) {
+            *PENDING_CMD.lock().unwrap() = Some(cmd.clone());
+            log(&format!("[agent] proposed command: {cmd}"));
+            let ask = if is_cyrillic(&say) { " Сказать да или нет?" } else { " Say yes or no." };
+            let speak = format!("{}{}", clean_for_speech(&say), ask);
+            return Ok(Response { volume: None, pcm: windows_tts(cfg, &speak)? });
+        }
+        // Not an action: speak the answer (from JSON `say`, else the raw text).
+        let say = parse_decision(&raw)
+            .map(|(_, s, _)| s)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| raw.clone());
+        return Ok(Response { volume: None, pcm: windows_tts(cfg, &clean_for_speech(&say))? });
+    }
+
+    let reply = clean_for_speech(&raw);
     if reply.is_empty() {
         return Ok(Response { volume: None, pcm: Vec::new() });
     }
-
-    // TTS (Windows SAPI).
-    let t = Instant::now();
     let pcm = windows_tts(cfg, &reply)?;
-    log(&format!("[tts {:?}] {} bytes PCM", t.elapsed(), pcm.len()));
     Ok(Response { volume: None, pcm })
+}
+
+/// True if the text contains any Cyrillic letters (used to pick the reply language).
+fn is_cyrillic(t: &str) -> bool {
+    t.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+}
+
+fn has_word(t: &str, words: &[&str]) -> bool {
+    let lt = t.to_lowercase();
+    lt.split(|c: char| !c.is_alphanumeric())
+        .any(|w| words.contains(&w))
+}
+
+fn is_affirmative(t: &str) -> bool {
+    has_word(
+        t,
+        &["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "да", "ага", "давай", "конечно", "угу", "ладно"],
+    )
+}
+
+fn is_negative(t: &str) -> bool {
+    has_word(
+        t,
+        &["no", "nope", "cancel", "stop", "нет", "отмена", "отмени", "стоп", "неа"],
+    )
+}
+
+/// Run a Windows command (the agent's proposed action) detached. Returns spawn success.
+fn run_pc_command(cmd: &str) -> bool {
+    Command::new("cmd")
+        .args(["/C", cmd])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Parse the agent decision JSON -> (action, say, cmd).
+fn parse_decision(text: &str) -> Option<(bool, String, Option<String>)> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text[start..=end]).ok()?;
+    let action = v["action"].as_bool().unwrap_or(false);
+    let say = v["say"].as_str().unwrap_or("").to_string();
+    let cmd = v["cmd"].as_str().map(str::to_string).filter(|s| !s.is_empty());
+    Some((action, say, cmd))
+}
+
+/// Prompt that lets claude either answer or propose a PC command (as JSON).
+fn agent_prompt(transcript: &str) -> String {
+    let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
+    format!(
+        "You are a voice assistant that can ANSWER questions or CONTROL this Windows PC. \
+         Current local time: {now_local} (use it for time questions; convert zones from UTC). \
+         The user said (transcribed speech, may contain errors): \"{transcript}\".\n\
+         If the user wants to DO something on the PC (open a folder/app/file, launch a \
+         program, run a command, create/move files), reply with EXACTLY this JSON:\n\
+         {{\"action\":true,\"say\":\"<one short sentence in the USER'S language describing what you will do>\",\"cmd\":\"<a single Windows cmd.exe command that does it; use %USERPROFILE% for the home folder>\"}}\n\
+         Otherwise (a question or chat; you MAY use web search for live facts), reply with:\n\
+         {{\"action\":false,\"say\":\"<spoken answer in the USER'S language, 1-2 short sentences, no URLs or markdown>\"}}\n\
+         Output ONLY the JSON object and nothing else."
+    )
 }
 
 /// Transcribe device PCM. Default engine is Windows System.Speech (pure Windows,
