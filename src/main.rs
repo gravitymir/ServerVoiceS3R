@@ -319,8 +319,13 @@ fn clean_for_speech(text: &str) -> String {
 
 /// Shared voice-assistant instruction wrapped around the transcript.
 fn voice_prompt(transcript: &str) -> String {
+    let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
+    let now_utc = chrono::Utc::now().format("%H:%M UTC");
     format!(
-        "You are a warm, concise voice assistant speaking through a small smart speaker. \
+        "Current time is {now_local} (= {now_utc}); this server's local time is the \
+         user's local time. Use it for any time/date question and compute other time \
+         zones from UTC — do NOT guess or web-search the time. \
+         You are a warm, concise voice assistant speaking through a small smart speaker. \
          Answer the user's spoken words directly in 1-2 short sentences of plain speech. \
          Reply in the SAME language the user used (Russian or English). \
          You may search the web for current info (weather, news, facts) and answer with it, \
