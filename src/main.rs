@@ -26,6 +26,47 @@ const TTS_RATE: u32 = 24_000; // OpenAI TTS pcm sample rate
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+/// What to send back to the device.
+struct Response {
+    /// New speaker volume 0..=100, or None to leave it unchanged.
+    volume: Option<u8>,
+    /// Response audio (16 kHz mono s16le PCM).
+    pcm: Vec<u8>,
+}
+
+/// Recognize a spoken volume command like "set volume 60" / "volume to eighty".
+/// Returns the requested level 0..=100 if the transcript is a volume command.
+fn parse_volume(transcript: &str) -> Option<u8> {
+    let t = transcript.to_lowercase();
+    if !t.contains("volume") && !t.contains("vol ") {
+        return None;
+    }
+    // Digits first (e.g. "set volume 60").
+    let mut num = String::new();
+    for ch in t.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else if !num.is_empty() {
+            break;
+        }
+    }
+    if let Ok(n) = num.parse::<u32>() {
+        return Some(n.min(100) as u8);
+    }
+    // Spoken number words (volume is usually round).
+    for (word, val) in [
+        ("hundred", 100u8), ("ninety", 90), ("eighty", 80), ("seventy", 70),
+        ("sixty", 60), ("fifty", 50), ("forty", 40), ("thirty", 30),
+        ("twenty", 20), ("ten", 10), ("zero", 0), ("mute", 0),
+        ("max", 100), ("full", 100), ("min", 0),
+    ] {
+        if t.contains(word) {
+            return Some(val);
+        }
+    }
+    None
+}
+
 struct Config {
     api_key: String,
     port: u16,
@@ -34,8 +75,11 @@ struct Config {
     tts_voice: String,
     stt_model: String,
     mode: String,
+    stt_engine: String, // "sapi" (Windows System.Speech) | "whisper" (local HTTP)
+    stt_url: String,
     stt_script: PathBuf,
     tts_script: PathBuf,
+    debug_wav: bool,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -66,15 +110,25 @@ fn main() -> Result<()> {
         tts_voice: env_or("TTS_VOICE", "alloy"),
         stt_model: env_or("STT_MODEL", "whisper-1"),
         mode,
+        stt_engine: env_or("STT_ENGINE", "whisper").to_lowercase(),
+        stt_url: env_or("STT_URL", "http://127.0.0.1:9100/stt"),
         stt_script,
         tts_script,
+        debug_wav: std::env::var("DEBUG_WAV").is_ok(),
     };
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
     log(&format!("MODE = {}", cfg.mode));
     match cfg.mode.as_str() {
-        "windows" => log("STT: Windows System.Speech  |  reply: claude CLI  |  TTS: Windows SAPI"),
+        "windows" => {
+            let stt = if cfg.stt_engine == "whisper" {
+                format!("local Whisper @ {}", cfg.stt_url)
+            } else {
+                "Windows System.Speech".to_string()
+            };
+            log(&format!("STT: {stt}  |  reply: claude CLI  |  TTS: Windows SAPI"));
+        }
         "openai" => log(&format!(
             "OpenAI: stt={} chat={} tts={} voice={}",
             cfg.stt_model, cfg.chat_model, cfg.tts_model, cfg.tts_voice
@@ -123,11 +177,20 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // 2. Produce the response audio according to the mode.
-    let out_pcm = match cfg.mode.as_str() {
+    if cfg.debug_wav {
+        let _ = std::fs::write("debug_last.wav", pcm_to_wav(&pcm, DEVICE_RATE));
+        let _ = std::fs::write("debug_last.pcm", &pcm);
+        log("[debug] saved debug_last.wav / debug_last.pcm");
+    }
+
+    // 2. Produce the response according to the mode.
+    let resp = match cfg.mode.as_str() {
         "loopback" => {
             log(&format!("[loopback] echoing {} bytes", pcm.len()));
-            pcm.clone()
+            Response {
+                volume: None,
+                pcm: pcm.clone(),
+            }
         }
         "windows" => windows_brain(&pcm, cfg)?,
         "openai" => openai_brain(&pcm, cfg)?,
@@ -137,13 +200,20 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         }
     };
 
-    if out_pcm.is_empty() {
-        log("[skip] no response audio");
+    if resp.pcm.is_empty() && resp.volume.is_none() {
+        log("[skip] nothing to send");
         return Ok(());
     }
 
-    // 3. Stream the response back and close.
-    stream.write_all(&out_pcm).context("writing response PCM")?;
+    // 3. Send: 1 control byte (0xFF = no volume change, else 0..=100) + PCM.
+    let ctrl = resp.volume.unwrap_or(0xFF);
+    if let Some(v) = resp.volume {
+        log(&format!("[volume] -> {v}"));
+    }
+    stream.write_all(&[ctrl]).context("writing control header")?;
+    if !resp.pcm.is_empty() {
+        stream.write_all(&resp.pcm).context("writing response PCM")?;
+    }
     stream.flush().ok();
     log(&format!("[done] total {:?}", t0.elapsed()));
     Ok(())
@@ -151,56 +221,85 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
 
 // ───────────────────────── Windows-native brain ─────────────────────────
 
-fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Vec<u8>> {
-    let tmp = std::env::temp_dir();
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let wav_in = tmp.join(format!("vs3r_in_{id}.wav"));
-    let txt = tmp.join(format!("vs3r_reply_{id}.txt"));
-    let wav_out = tmp.join(format!("vs3r_out_{id}.wav"));
-
-    std::fs::write(&wav_in, pcm_to_wav(pcm, DEVICE_RATE))?;
-
+fn windows_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     // STT (Windows System.Speech).
     let t = Instant::now();
-    let transcript = run_ps(&cfg.stt_script, &["-Wav", path_str(&wav_in)?])?
-        .trim()
-        .to_string();
+    let transcript = windows_stt(cfg, pcm)?;
     log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
     if transcript.is_empty() {
-        cleanup(&[&wav_in, &txt, &wav_out]);
         log("[skip] empty transcript (mic too quiet or not recognized)");
-        return Ok(Vec::new());
+        return Ok(Response { volume: None, pcm: Vec::new() });
+    }
+
+    // Voice command: "set volume N" — apply on the device, confirm by speech.
+    if let Some(v) = parse_volume(&transcript) {
+        let pcm = windows_tts(cfg, &format!("Volume set to {v}."))?;
+        return Ok(Response { volume: Some(v), pcm });
     }
 
     // Reply (claude CLI, prompt via stdin to avoid quoting issues).
     let t = Instant::now();
-    let prompt = format!(
-        "You are a warm, concise voice assistant speaking through a small smart speaker. \
-         Answer the user's spoken words directly in 1-2 short sentences of plain speech. \
-         Never mention coding, tasks, tools, or that you are an AI/CLI; never use markdown, \
-         lists, or emojis. If the words are unclear, make a friendly best guess rather than \
-         asking what they meant.\n\nUser said: {transcript}"
-    );
-    let reply = run_claude(&prompt)?.trim().to_string();
+    let reply = run_claude(&voice_prompt(&transcript))?.trim().to_string();
     log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
     if reply.is_empty() {
-        cleanup(&[&wav_in, &txt, &wav_out]);
-        return Ok(Vec::new());
+        return Ok(Response { volume: None, pcm: Vec::new() });
     }
 
-    // TTS (Windows SAPI -> 16 kHz mono WAV).
+    // TTS (Windows SAPI).
     let t = Instant::now();
-    std::fs::write(&txt, &reply)?;
+    let pcm = windows_tts(cfg, &reply)?;
+    log(&format!("[tts {:?}] {} bytes PCM", t.elapsed(), pcm.len()));
+    Ok(Response { volume: None, pcm })
+}
+
+/// Transcribe device PCM. Default engine is Windows System.Speech (pure Windows,
+/// no Python); set STT_ENGINE=whisper to use the local Whisper microservice.
+fn windows_stt(cfg: &Config, pcm: &[u8]) -> Result<String> {
+    if cfg.stt_engine == "whisper" {
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(&cfg.stt_url)
+            .body(pcm.to_vec())
+            .send()
+            .with_context(|| format!("POST {} — is stt_server.py running?", cfg.stt_url))?;
+        let body = resp.text()?;
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        return Ok(v["text"].as_str().unwrap_or("").trim().to_string());
+    }
+
+    // Windows System.Speech: write a WAV and run the recognizer script.
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let wav_in = std::env::temp_dir().join(format!("vs3r_in_{id}.wav"));
+    std::fs::write(&wav_in, pcm_to_wav(pcm, DEVICE_RATE))?;
+    let text = run_ps(&cfg.stt_script, &["-Wav", path_str(&wav_in)?])?;
+    cleanup(&[&wav_in]);
+    Ok(text.trim().to_string())
+}
+
+/// Synthesize text to 16 kHz mono PCM with Windows SAPI.
+fn windows_tts(cfg: &Config, text: &str) -> Result<Vec<u8>> {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let txt = std::env::temp_dir().join(format!("vs3r_reply_{id}.txt"));
+    let wav_out = std::env::temp_dir().join(format!("vs3r_out_{id}.wav"));
+    std::fs::write(&txt, text)?;
     run_ps(
         &cfg.tts_script,
         &["-TextFile", path_str(&txt)?, "-Out", path_str(&wav_out)?],
     )?;
     let wav = std::fs::read(&wav_out)?;
-    let out_pcm = wav_to_pcm(&wav);
-    log(&format!("[tts {:?}] {} bytes PCM", t.elapsed(), out_pcm.len()));
+    cleanup(&[&txt, &wav_out]);
+    Ok(wav_to_pcm(&wav))
+}
 
-    cleanup(&[&wav_in, &txt, &wav_out]);
-    Ok(out_pcm)
+/// Shared voice-assistant instruction wrapped around the transcript.
+fn voice_prompt(transcript: &str) -> String {
+    format!(
+        "You are a warm, concise voice assistant speaking through a small smart speaker. \
+         Answer the user's spoken words directly in 1-2 short sentences of plain speech. \
+         Never mention coding, tasks, tools, or that you are an AI/CLI; never use markdown, \
+         lists, or emojis. If the words are unclear, make a friendly best guess rather than \
+         asking what they meant.\n\nUser said: {transcript}"
+    )
 }
 
 fn run_ps(script: &Path, args: &[&str]) -> Result<String> {
@@ -248,7 +347,7 @@ fn cleanup(paths: &[&Path]) {
     }
 }
 
-/// Write the Windows STT/TTS helper scripts to temp and return their paths.
+/// Write the Windows System.Speech STT + SAPI TTS helper scripts; return paths.
 fn write_scripts() -> Result<(PathBuf, PathBuf)> {
     let dir = std::env::temp_dir();
     let stt = dir.join("vs3r_stt.ps1");
@@ -284,23 +383,35 @@ $synth.Dispose()
 
 // ───────────────────────────── OpenAI brain ─────────────────────────────
 
-fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Vec<u8>> {
+fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     let client = reqwest::blocking::Client::new();
 
     let t = Instant::now();
     let wav = pcm_to_wav(pcm, DEVICE_RATE);
-    let transcript = transcribe(&client, cfg, wav)?;
-    log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript.trim()));
-    if transcript.trim().is_empty() {
-        return Ok(Vec::new());
+    let transcript = transcribe(&client, cfg, wav)?.trim().to_string();
+    log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
+    if transcript.is_empty() {
+        return Ok(Response { volume: None, pcm: Vec::new() });
+    }
+
+    // Voice command: "set volume N".
+    if let Some(v) = parse_volume(&transcript) {
+        let pcm = openai_tts(&client, cfg, &format!("Volume set to {v}."))?;
+        return Ok(Response { volume: Some(v), pcm });
     }
 
     let t = Instant::now();
-    let reply = chat(&client, cfg, transcript.trim())?;
+    let reply = chat(&client, cfg, &transcript)?;
     log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply.trim()));
 
+    let pcm = openai_tts(&client, cfg, reply.trim())?;
+    Ok(Response { volume: None, pcm })
+}
+
+/// OpenAI TTS (24 kHz PCM) resampled to the device's 16 kHz.
+fn openai_tts(client: &reqwest::blocking::Client, cfg: &Config, text: &str) -> Result<Vec<u8>> {
     let t = Instant::now();
-    let tts_pcm = synthesize(&client, cfg, reply.trim())?;
+    let tts_pcm = synthesize(client, cfg, text)?;
     let out_pcm = resample(&tts_pcm, TTS_RATE, DEVICE_RATE);
     log(&format!(
         "[tts {:?}] {} bytes @24k -> {} bytes @16k",
