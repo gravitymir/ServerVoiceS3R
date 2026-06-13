@@ -19,7 +19,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 import whisper
 
-MODEL_NAME = sys.argv[1] if len(sys.argv) > 1 else "base.en"
+# "turbo" (large-v3-turbo) is multilingual — auto-detects Russian/English/etc.
+MODEL_NAME = sys.argv[1] if len(sys.argv) > 1 else "turbo"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 9100
 
 print(f"[stt] loading whisper model '{MODEL_NAME}' (first run downloads it)...", flush=True)
@@ -39,9 +40,11 @@ class Handler(BaseHTTPRequestHandler):
             # Raw s16le mono PCM -> float32 [-1, 1], which whisper accepts directly
             # (avoids needing ffmpeg to decode a file).
             audio = np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
-            result = model.transcribe(audio, language="en", fp16=False)
+            # No fixed language -> Whisper auto-detects (Russian, English, ...).
+            result = model.transcribe(audio, fp16=False)
             text = (result.get("text") or "").strip()
-            print(f"[stt] {len(audio)/16000:.1f}s -> {text!r}", flush=True)
+            lang = result.get("language", "?")
+            print(f"[stt] {len(audio)/16000:.1f}s [{lang}] -> {text!r}", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[stt] error: {e}", flush=True)
         body = json.dumps({"text": text}).encode("utf-8")
