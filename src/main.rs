@@ -79,6 +79,7 @@ struct Config {
     stt_url: String,
     stt_script: PathBuf,
     tts_script: PathBuf,
+    tts_speed: String,
     debug_wav: bool,
 }
 
@@ -114,6 +115,7 @@ fn main() -> Result<()> {
         stt_url: env_or("STT_URL", "http://127.0.0.1:9100/stt"),
         stt_script,
         tts_script,
+        tts_speed: env_or("TTS_SPEED", "1.3"), // 1.0 = normal, higher = faster
         debug_wav: std::env::var("DEBUG_WAV").is_ok(),
     };
 
@@ -284,7 +286,7 @@ fn windows_tts(cfg: &Config, text: &str) -> Result<Vec<u8>> {
     std::fs::write(&txt, text)?;
     run_ps(
         &cfg.tts_script,
-        &["-TextFile", path_str(&txt)?, "-Out", path_str(&wav_out)?],
+        &["-TextFile", path_str(&txt)?, "-Out", path_str(&wav_out)?, "-Rate", &cfg.tts_speed],
     )?;
     let wav = std::fs::read(&wav_out)?;
     cleanup(&[&txt, &wav_out]);
@@ -296,6 +298,7 @@ fn voice_prompt(transcript: &str) -> String {
     format!(
         "You are a warm, concise voice assistant speaking through a small smart speaker. \
          Answer the user's spoken words directly in 1-2 short sentences of plain speech. \
+         Reply in the SAME language the user used (Russian or English). \
          Never mention coding, tasks, tools, or that you are an AI/CLI; never use markdown, \
          lists, or emojis. If the words are unclear, make a friendly best guess rather than \
          asking what they meant.\n\nUser said: {transcript}"
@@ -371,14 +374,39 @@ $rec.Dispose()
 [Console]::Out.Write($sb.ToString().Trim())
 "#;
 
-const TTS_PS: &str = r#"param([Parameter(Mandatory=$true)][string]$TextFile,[Parameter(Mandatory=$true)][string]$Out)
-Add-Type -AssemblyName System.Speech
+// WinRT TTS: reaches OneCore voices (incl. Russian Irina/Pavel), auto-selects a
+// voice by language (Cyrillic -> Russian, else English), outputs 16 kHz mono WAV.
+const TTS_PS: &str = r#"param([Parameter(Mandatory=$true)][string]$TextFile,[Parameter(Mandatory=$true)][string]$Out,[double]$Rate=1.0)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $text = [System.IO.File]::ReadAllText($TextFile)
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000,[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen,[System.Speech.AudioFormat.AudioChannel]::Mono)
-$synth.SetOutputToWaveFile($Out,$fmt)
-$synth.Speak($text)
-$synth.Dispose()
+[void][Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media, ContentType=WindowsRuntime]
+[void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType=WindowsRuntime]
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+  $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+} | Select-Object -First 1
+function Await($op, $resultType) {
+  $m = $asTask.MakeGenericMethod($resultType)
+  $t = $m.Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result
+}
+$synth = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer
+$synth.Options.SpeakingRate = [Math]::Min([Math]::Max($Rate, 0.5), 6.0)
+$isRu = $text -match '\p{IsCyrillic}'
+$pick = $null
+foreach ($v in [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices) {
+  if ($isRu) { if ($v.Language -like 'ru*') { $pick = $v; break } }
+  else       { if ($v.Language -like 'en*') { $pick = $v; break } }
+}
+if ($pick) { $synth.Voice = $pick }
+$streamType = [Windows.Media.SpeechSynthesis.SpeechSynthesisStream]
+$stream = Await ($synth.SynthesizeTextToStreamAsync($text)) $streamType
+$size = [uint32]$stream.Size
+$reader = New-Object Windows.Storage.Streams.DataReader($stream)
+[void](Await ($reader.LoadAsync($size)) ([uint32]))
+$bytes = New-Object byte[] $size
+$reader.ReadBytes($bytes)
+[System.IO.File]::WriteAllBytes($Out, $bytes)
 "#;
 
 // ───────────────────────────── OpenAI brain ─────────────────────────────
