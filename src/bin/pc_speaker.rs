@@ -24,9 +24,37 @@ fn main() {
         .unwrap_or(9001);
 
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .expect("no default output device");
+
+    // List output devices so we can see what's available to mirror.
+    if let Ok(devs) = host.output_devices() {
+        println!("[speaker] available output devices:");
+        for d in devs {
+            println!("   - {}", d.name().unwrap_or_default());
+        }
+    }
+
+    // Pick the output device to loopback-capture: SPEAKER_DEVICE (name substring,
+    // case-insensitive) if set, otherwise the system default. Speaker mode mirrors
+    // whatever this device is playing, so it must be the one you actually hear.
+    let device = match std::env::var("SPEAKER_DEVICE") {
+        Ok(want) if !want.trim().is_empty() => {
+            let want = want.to_lowercase();
+            host.output_devices()
+                .ok()
+                .and_then(|mut it| {
+                    it.find(|d| {
+                        d.name()
+                            .map(|n| n.to_lowercase().contains(&want))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or_else(|| {
+                    println!("[speaker] SPEAKER_DEVICE='{want}' not found, using default");
+                    host.default_output_device().expect("no default output device")
+                })
+        }
+        _ => host.default_output_device().expect("no default output device"),
+    };
     println!(
         "[speaker] loopback-capturing: {}",
         device.name().unwrap_or_default()
@@ -107,6 +135,10 @@ fn main() {
             Err(_) => continue,
         };
         c.set_nodelay(true).ok();
+        // Write timeout so a dead/stale client (e.g. the device reset or
+        // reflashed) fails fast and we move on to the next connection instead of
+        // blocking here forever (which would starve the real client of audio).
+        c.set_write_timeout(Some(Duration::from_secs(2))).ok();
         let peer = c.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         println!("[speaker] device connected: {peer}");
         // Clear any backlog so we start near-live.

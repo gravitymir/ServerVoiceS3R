@@ -29,6 +29,10 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 /// A PC command the agent proposed, awaiting the user's spoken yes/no.
 static PENDING_CMD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Last volume the skills agent set on the device (so it can reason about
+/// relative requests like "louder" / "тише").
+static LAST_VOLUME: std::sync::Mutex<u8> = std::sync::Mutex::new(75);
+
 /// Control byte sent before the PCM: 0xFF = no change, 0..=100 = set volume,
 /// 0xFE = enter speaker mode (device connects to the pc_speaker stream).
 const CTRL_NONE: u8 = 0xFF;
@@ -46,30 +50,34 @@ struct Response {
 /// Returns the requested level 0..=100 if the transcript is a volume command.
 fn parse_volume(transcript: &str) -> Option<u8> {
     let t = transcript.to_lowercase();
-    if !t.contains("volume") && !t.contains("vol ") {
+    // Trigger word in English or Russian. "мкост" tolerates common Whisper
+    // mis-hearings of "громкость" (гломкость / грамкость / ...).
+    let is_vol = t.contains("volume") || t.contains("vol ")
+        || t.contains("мкост") || t.contains("звук") || t.contains("громк") || t.contains("гломк");
+    if !is_vol {
         return None;
     }
-    // Digits first (e.g. "set volume 60").
-    let mut num = String::new();
-    for ch in t.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
-        } else if !num.is_empty() {
-            break;
-        }
-    }
-    if let Ok(n) = num.parse::<u32>() {
+    // First run of digits, e.g. "set volume 60" / "громкость 60".
+    let digits: String = t
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if let Ok(n) = digits.parse::<u32>() {
         return Some(n.min(100) as u8);
     }
-    // Spoken number words (volume is usually round).
-    for (word, val) in [
-        ("hundred", 100u8), ("ninety", 90), ("eighty", 80), ("seventy", 70),
+    // Spoken number words (whole-word match), English + Russian.
+    let words: &[(&str, u8)] = &[
+        ("hundred", 100), ("ninety", 90), ("eighty", 80), ("seventy", 70),
         ("sixty", 60), ("fifty", 50), ("forty", 40), ("thirty", 30),
-        ("twenty", 20), ("ten", 10), ("zero", 0), ("mute", 0),
-        ("max", 100), ("full", 100), ("min", 0),
-    ] {
-        if t.contains(word) {
-            return Some(val);
+        ("twenty", 20), ("ten", 10), ("zero", 0), ("mute", 0), ("max", 100), ("full", 100), ("min", 0),
+        ("сто", 100), ("девяносто", 90), ("восемьдесят", 80), ("семьдесят", 70),
+        ("шестьдесят", 60), ("пятьдесят", 50), ("сорок", 40), ("тридцать", 30),
+        ("двадцать", 20), ("десять", 10), ("ноль", 0), ("максимум", 100), ("макс", 100),
+    ];
+    for (w, v) in words {
+        if has_word(&t, &[w]) {
+            return Some(*v);
         }
     }
     None
@@ -103,9 +111,9 @@ fn main() -> Result<()> {
         env_or("MODE", "windows").to_lowercase()
     };
 
-    let api_key = if mode == "openai" {
+    let api_key = if mode == "openai" || mode == "skills" {
         std::env::var("OPENAI_API_KEY")
-            .map_err(|_| anyhow!("MODE=openai needs OPENAI_API_KEY"))?
+            .map_err(|_| anyhow!("MODE={mode} needs OPENAI_API_KEY (for Whisper STT + TTS)"))?
     } else {
         String::new()
     };
@@ -144,6 +152,10 @@ fn main() -> Result<()> {
         "openai" => log(&format!(
             "OpenAI: stt={} chat={} tts={} voice={}",
             cfg.stt_model, cfg.chat_model, cfg.tts_model, cfg.tts_voice
+        )),
+        "skills" => log(&format!(
+            "Skills agent: STT=OpenAI {} | brain=claude CLI (web search) | TTS=OpenAI {} voice={}",
+            cfg.stt_model, cfg.tts_model, cfg.tts_voice
         )),
         "loopback" => log("echoing recorded audio back (no AI)"),
         other => log(&format!("WARNING: unknown MODE '{other}'")),
@@ -206,6 +218,7 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         }
         "windows" => windows_brain(&pcm, cfg)?,
         "openai" => openai_brain(&pcm, cfg)?,
+        "skills" => skills_brain(&pcm, cfg)?,
         other => {
             log(&format!("[error] unknown MODE '{other}'"));
             return Ok(());
@@ -602,12 +615,131 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
         return Ok(Response { control: v, pcm });
     }
 
+    // Voice command: enter PC-speaker mode (RU/EN).
+    if is_speaker_cmd(&transcript) {
+        let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+        let say = if ru {
+            "Включаю режим колонки."
+        } else {
+            "Speaker mode on."
+        };
+        log("[control] -> enter speaker mode");
+        let pcm = openai_tts(&client, cfg, say)?;
+        return Ok(Response { control: CTRL_SPEAKER, pcm });
+    }
+
     let t = Instant::now();
     let reply = clean_for_speech(&chat(&client, cfg, &transcript)?);
     log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
 
     let pcm = openai_tts(&client, cfg, &reply)?;
     Ok(Response { control: CTRL_NONE, pcm })
+}
+
+// ───────────────────────── Skills agent (Claude brain) ─────────────────────
+//
+// STT (OpenAI Whisper) -> Claude CLI brain that picks a SKILL -> OpenAI TTS.
+// Claude understands the device's abilities instead of us keyword-matching, so
+// any phrasing/language works. Add a skill = add a line to `skills_prompt`.
+
+fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
+    let client = reqwest::blocking::Client::new();
+
+    let t = Instant::now();
+    let wav = pcm_to_wav(pcm, DEVICE_RATE);
+    let transcript = transcribe(&client, cfg, wav)?.trim().to_string();
+    log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
+    if transcript.is_empty() {
+        return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
+    }
+
+    let cur_vol = *LAST_VOLUME.lock().unwrap();
+    let t = Instant::now();
+    let raw = run_claude(&skills_prompt(&transcript, cur_vol))?;
+    log(&format!("[llm {:?}] {}", t.elapsed(), raw.replace('\n', " ").trim()));
+
+    // Parse the skill decision; fall back to speaking the raw text as an answer.
+    let (skill, level, say) =
+        parse_skill(&raw).unwrap_or_else(|| ("answer".to_string(), None, clean_for_speech(&raw)));
+    let say = clean_for_speech(&say);
+
+    match skill.as_str() {
+        "volume" => {
+            let v = level.unwrap_or(cur_vol).min(100);
+            *LAST_VOLUME.lock().unwrap() = v;
+            log(&format!("[skill] volume -> {v}"));
+            let words = if say.is_empty() { format!("Volume {v}.") } else { say };
+            let pcm = openai_tts(&client, cfg, &words)?;
+            Ok(Response { control: v, pcm })
+        }
+        "speaker" => {
+            // Optional `level` => compound "set volume AND enter speaker mode".
+            let control = match level {
+                Some(v) => {
+                    let v = v.min(100);
+                    *LAST_VOLUME.lock().unwrap() = v;
+                    log(&format!("[skill] volume -> {v} + speaker mode"));
+                    128u8.saturating_add(v) // device decodes 128..=228 as vol+speaker
+                }
+                None => {
+                    log("[skill] -> enter speaker mode");
+                    CTRL_SPEAKER
+                }
+            };
+            let words = if say.is_empty() { "Speaker mode on.".to_string() } else { say };
+            let pcm = openai_tts(&client, cfg, &words)?;
+            Ok(Response { control, pcm })
+        }
+        _ => {
+            log("[skill] -> answer");
+            if say.is_empty() {
+                return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
+            }
+            let pcm = openai_tts(&client, cfg, &say)?;
+            Ok(Response { control: CTRL_NONE, pcm })
+        }
+    }
+}
+
+/// The skill catalogue the Claude brain chooses from. Current volume is included
+/// so it can handle relative requests ("louder", "тише").
+fn skills_prompt(transcript: &str, cur_volume: u8) -> String {
+    let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
+    format!(
+        "You are the brain of a small voice smart-speaker ('ATOM'). The user speaks to it; you \
+         decide what it should DO. Current local time: {now_local} (use it for time/date questions; \
+         never web-search the time). The speaker's current volume is {cur_volume} (0-100).\n\n\
+         Reply with EXACTLY ONE JSON object and nothing else, choosing the single best SKILL:\n\
+         1) Set playback volume (understand any phrasing: \"громкость 50\", \"сделай громче\", \
+         \"тише\", \"louder\", \"max\"; for relative requests adjust from the current volume by ~15):\n\
+         {{\"skill\":\"volume\",\"level\":<0-100>,\"say\":\"<short confirmation in the user's language>\"}}\n\
+         2) Switch to PC-speaker mode (the speaker plays the computer's audio), e.g. \"режим колонки\", \
+         \"speaker mode\". You MAY also set the volume in the same step with an optional \"level\" — \
+         use this when the user asks for BOTH a volume and speaker mode in one sentence (e.g. \
+         \"громкость 70 и включи режим колонки\"):\n\
+         {{\"skill\":\"speaker\",\"level\":<optional 0-100>,\"say\":\"<short confirmation>\"}}\n\
+         3) Answer a question or chat (you MAY use web search for live facts like weather/news):\n\
+         {{\"skill\":\"answer\",\"say\":\"<the spoken answer>\"}}\n\n\
+         Rules for 'say': ONE short sentence, in the SAME language the user used (Russian or English); \
+         for weather give only the current conditions, never a multi-day forecast unless asked; never \
+         include URLs, citations, markdown, lists, or emojis. Output ONLY the JSON object.\n\n\
+         User said: \"{transcript}\""
+    )
+}
+
+/// Extract (skill, level, say) from Claude's JSON reply. Tolerant of surrounding
+/// text: takes the outermost {...}.
+fn parse_skill(raw: &str) -> Option<(String, Option<u8>, String)> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&raw[start..=end]).ok()?;
+    let skill = v["skill"].as_str()?.to_string();
+    let level = v["level"].as_u64().map(|n| n.min(100) as u8);
+    let say = v["say"].as_str().unwrap_or("").to_string();
+    Some((skill, level, say))
 }
 
 /// OpenAI TTS (24 kHz PCM) resampled to the device's 16 kHz.
@@ -653,8 +785,12 @@ fn chat(client: &reqwest::blocking::Client, cfg: &Config, user: &str) -> Result<
         "model": cfg.chat_model,
         "messages": [
             {"role": "system", "content":
-                "You are a friendly voice assistant on a small speaker. Reply in a concise, \
-                 natural, spoken style — usually 1-2 short sentences. No markdown or emojis."},
+                "You are a voice assistant on a small smart speaker. Answer in ONE short \
+                 spoken sentence (two only if truly necessary). Be direct — give just the key \
+                 fact, not background. For weather, give ONLY the current conditions \
+                 (temperature and sky) for the asked place, never a multi-day forecast unless \
+                 explicitly asked. Never use lists, markdown, URLs, or emojis. Reply in the \
+                 user's language (Russian or English)."},
             {"role": "user", "content": user}
         ]
     });
@@ -677,11 +813,14 @@ fn chat(client: &reqwest::blocking::Client, cfg: &Config, user: &str) -> Result<
 }
 
 fn synthesize(client: &reqwest::blocking::Client, cfg: &Config, text: &str) -> Result<Vec<u8>> {
+    // TTS_SPEED controls pace (OpenAI accepts 0.25–4.0; default 1.0).
+    let speed: f32 = cfg.tts_speed.parse().unwrap_or(1.3);
     let body = serde_json::json!({
         "model": cfg.tts_model,
         "voice": cfg.tts_voice,
         "input": text,
-        "response_format": "pcm"
+        "response_format": "pcm",
+        "speed": speed
     });
     let resp = client
         .post("https://api.openai.com/v1/audio/speech")
