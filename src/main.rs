@@ -33,6 +33,13 @@ static PENDING_CMD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Non
 /// relative requests like "louder" / "тише").
 static LAST_VOLUME: std::sync::Mutex<u8> = std::sync::Mutex::new(75);
 
+/// M6 voice coding mode: while true, spoken commands are routed to a persistent
+/// Claude Code session in `code_dir` instead of the normal skills.
+static CODING_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the current coding-mode session has been started (controls --continue).
+static CODING_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Control byte sent before the PCM: 0xFF = no change, 0..=100 = set volume,
 /// 0xFE = enter speaker mode (device connects to the pc_speaker stream).
 const CTRL_NONE: u8 = 0xFF;
@@ -98,6 +105,7 @@ struct Config {
     tts_speed: String,
     agent: bool, // allow voice commands to run PC actions (with spoken confirmation)
     debug_wav: bool,
+    code_dir: String, // project folder for voice "coding mode" (M6)
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -135,6 +143,7 @@ fn main() -> Result<()> {
         tts_speed: env_or("TTS_SPEED", "1.3"), // 1.0 = normal, higher = faster
         agent: env_or("AGENT", "1") != "0",
         debug_wav: std::env::var("DEBUG_WAV").is_ok(),
+        code_dir: env_or("CODE_DIR", "C:/Users/gravi/voice-code"),
     };
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -153,10 +162,14 @@ fn main() -> Result<()> {
             "OpenAI: stt={} chat={} tts={} voice={}",
             cfg.stt_model, cfg.chat_model, cfg.tts_model, cfg.tts_voice
         )),
-        "skills" => log(&format!(
-            "Skills agent: STT=OpenAI {} | brain=claude CLI (web search) | TTS=OpenAI {} voice={}",
-            cfg.stt_model, cfg.tts_model, cfg.tts_voice
-        )),
+        "skills" => {
+            std::fs::create_dir_all(&cfg.code_dir).ok();
+            log(&format!(
+                "Skills agent: STT=OpenAI {} | brain=claude CLI (web search) | TTS=OpenAI {} voice={}",
+                cfg.stt_model, cfg.tts_model, cfg.tts_voice
+            ));
+            log(&format!("Coding mode (M6) project dir: {}", cfg.code_dir));
+        }
         "loopback" => log("echoing recorded audio back (no AI)"),
         other => log(&format!("WARNING: unknown MODE '{other}'")),
     }
@@ -527,6 +540,114 @@ fn run_claude(prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+// ───────────────────────── M6: voice coding mode ───────────────────────────
+//
+// While CODING_MODE is on, spoken commands go to a PERSISTENT Claude Code
+// session (`claude -p --continue --dangerously-skip-permissions`) rooted in
+// `code_dir`, so it can actually read/edit files and run commands and remember
+// context across commands. It replies with one short spoken summary.
+
+fn is_coding_enter(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("coding mode")
+        || t.contains("start coding")
+        || t.contains("let's code")
+        || t.contains("режим программир")
+        || t.contains("программирован")
+        || t.contains("кодинг")
+}
+
+fn is_coding_exit(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("exit coding")
+        || t.contains("stop coding")
+        || t.contains("leave coding")
+        || t.contains("выйти из программ")
+        || t.contains("закончить программ")
+        || t.contains("стоп кодинг")
+        || t.contains("выйти из кодинг")
+}
+
+/// If the transcript is a coding-mode toggle, or we're already in coding mode,
+/// handle it and return the spoken Response. Returns None to fall through to
+/// the normal skills.
+fn coding_mode_step(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    transcript: &str,
+) -> Result<Option<Response>> {
+    let speak = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, words)? })
+    };
+
+    if CODING_MODE.load(Ordering::Relaxed) {
+        if is_coding_exit(transcript) {
+            CODING_MODE.store(false, Ordering::Relaxed);
+            log("[coding] exit");
+            return Ok(Some(speak("Exited coding mode.")?));
+        }
+        // Route the spoken command to the persistent Claude Code session.
+        let continue_session = CODING_STARTED.swap(true, Ordering::Relaxed);
+        let t = Instant::now();
+        log(&format!(
+            "[coding] {} (continue={continue_session}) in {}",
+            transcript, cfg.code_dir
+        ));
+        let reply = run_claude_coding(transcript, &cfg.code_dir, continue_session)?;
+        log(&format!("[coding {:?}] {}", t.elapsed(), reply.replace('\n', " ").trim()));
+        let say = clean_for_speech(&reply);
+        let say = if say.is_empty() { "Done.".to_string() } else { say };
+        return Ok(Some(speak(&say)?));
+    }
+
+    if is_coding_enter(transcript) {
+        CODING_MODE.store(true, Ordering::Relaxed);
+        CODING_STARTED.store(false, Ordering::Relaxed); // next command starts a fresh session
+        log(&format!("[coding] enter ({})", cfg.code_dir));
+        return Ok(Some(speak("Coding mode on. What should I build?")?));
+    }
+
+    Ok(None)
+}
+
+/// Run one turn of the Claude Code session in `code_dir`. Full tools + skip
+/// permission prompts (required for headless autonomy). Returns the spoken summary.
+fn run_claude_coding(transcript: &str, code_dir: &str, continue_session: bool) -> Result<String> {
+    let prompt = format!(
+        "You are a hands-free VOICE coding assistant in this project directory. \
+         CONTEXT YOU MUST RESPECT: the user runs a long session of many spoken commands in a row \
+         from across the room (6-10 meters away), listening through a small speaker. They are \
+         USUALLY NOT looking at the screen — your SPOKEN reply is their main way of knowing what \
+         happened. They only walk over to the screen occasionally, at milestones (e.g. to view a \
+         result in a browser). \
+         So do the real work with your tools (read/edit/create files, run commands), then SPEAK \
+         ONE short, clear, INFORMATIVE sentence (~12 words) — what you did or the result — in plain \
+         conversational speech. NEVER speak code, file paths, markdown, or lists. Only tell them to \
+         look at the screen when there is a visual result or a decision that truly needs their \
+         eyes. If you need a decision, ask ONE short question.\n\n\
+         User said: {transcript}"
+    );
+    let mut args: Vec<&str> = vec!["/C", "claude", "-p", "--dangerously-skip-permissions"];
+    if continue_session {
+        args.push("--continue");
+    }
+    let mut child = Command::new("cmd")
+        .args(&args)
+        .current_dir(code_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn claude (coding mode) in {code_dir}"))?;
+    child
+        .stdin
+        .take()
+        .context("claude stdin")?
+        .write_all(prompt.as_bytes())?;
+    let out = child.wait_with_output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn path_str(p: &Path) -> Result<&str> {
     p.to_str().context("non-UTF8 temp path")
 }
@@ -651,6 +772,11 @@ fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
     if transcript.is_empty() {
         return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
+    }
+
+    // M6: voice coding mode — if active (or being entered), route to Claude Code.
+    if let Some(resp) = coding_mode_step(&client, cfg, &transcript)? {
+        return Ok(resp);
     }
 
     let cur_vol = *LAST_VOLUME.lock().unwrap();
