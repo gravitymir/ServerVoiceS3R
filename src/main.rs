@@ -12,7 +12,7 @@
 //!
 //! Other env: PORT (9000), CHAT_MODEL, TTS_MODEL, TTS_VOICE, STT_MODEL.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -666,10 +666,22 @@ fn run_claude_coding(transcript: &str, code_dir: &str, continue_session: bool) -
          ONE short, clear, INFORMATIVE sentence (~12 words) — what you did or the result — in plain \
          conversational speech. NEVER speak code, file paths, markdown, or lists. Only tell them to \
          look at the screen when there is a visual result or a decision that truly needs their \
-         eyes. If you need a decision, ask ONE short question.\n\n\
+         eyes. If you need a decision, ask ONE short question. \
+         ALWAYS reply in the SAME language the user spoke (if they spoke Russian, answer in \
+         Russian; if English, English).\n\n\
          User said: {transcript}"
     );
-    let mut args: Vec<&str> = vec!["/C", "claude", "-p", "--dangerously-skip-permissions"];
+    // stream-json lets us log Claude's actions (commands, edits, narration) live
+    // in the terminal as they happen, while still returning the final summary.
+    let mut args: Vec<&str> = vec![
+        "/C",
+        "claude",
+        "-p",
+        "--dangerously-skip-permissions",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ];
     if continue_session {
         args.push("--continue");
     }
@@ -685,9 +697,71 @@ fn run_claude_coding(transcript: &str, code_dir: &str, continue_session: bool) -
         .stdin
         .take()
         .context("claude stdin")?
-        .write_all(prompt.as_bytes())?;
-    let out = child.wait_with_output()?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        .write_all(prompt.as_bytes())?; // dropped here -> closes stdin (EOF)
+
+    let stdout = child.stdout.take().context("claude stdout")?;
+    let reader = std::io::BufReader::new(stdout);
+    let mut final_text = String::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("assistant") => {
+                if let Some(blocks) = v["message"]["content"].as_array() {
+                    for b in blocks {
+                        match b["type"].as_str() {
+                            Some("text") => {
+                                let t = b["text"].as_str().unwrap_or("").trim();
+                                if !t.is_empty() {
+                                    log(&format!("    · {t}"));
+                                }
+                            }
+                            Some("tool_use") => {
+                                log(&format!(
+                                    "    ⚙ {}",
+                                    tool_summary(b["name"].as_str().unwrap_or("?"), &b["input"])
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                if let Some(r) = v["result"].as_str() {
+                    final_text = r.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = child.wait();
+    Ok(final_text)
+}
+
+/// One-line description of a Claude tool call for the live log.
+fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+    let detail = match name {
+        "Bash" => input["command"].as_str().unwrap_or(""),
+        "Edit" | "Write" | "Read" | "NotebookEdit" | "MultiEdit" => {
+            input["file_path"].as_str().unwrap_or("")
+        }
+        "Glob" | "Grep" => input["pattern"].as_str().unwrap_or(""),
+        _ => "",
+    };
+    let detail: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let detail: String = detail.chars().take(140).collect();
+    if detail.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}: {detail}")
+    }
 }
 
 fn path_str(p: &Path) -> Result<&str> {
