@@ -656,7 +656,9 @@ fn coding_mode_step(
 /// permission prompts (required for headless autonomy). Returns the spoken summary.
 fn run_claude_coding(transcript: &str, code_dir: &str, continue_session: bool) -> Result<String> {
     let prompt = format!(
-        "You are a hands-free VOICE coding assistant in this project directory. \
+        "You are Sophia, a hands-free FEMALE voice coding assistant in this project directory \
+         (always speak about yourself as a woman; in Russian ALWAYS use feminine forms like \
+         'сделала', 'запустила', 'готова', never masculine). \
          CONTEXT YOU MUST RESPECT: the user runs a long session of many spoken commands in a row \
          from across the room (6-10 meters away), listening through a small speaker. They are \
          USUALLY NOT looking at the screen — your SPOKEN reply is their main way of knowing what \
@@ -948,9 +950,12 @@ fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
 fn skills_prompt(transcript: &str, cur_volume: u8) -> String {
     let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
     format!(
-        "You are the brain of a small voice smart-speaker ('ATOM'). The user speaks to it; you \
-         decide what it should DO. Current local time: {now_local} (use it for time/date questions; \
-         never web-search the time). The speaker's current volume is {cur_volume} (0-100).\n\n\
+        "You are Sophia, a warm, friendly FEMALE voice assistant — always speak about yourself as a \
+         woman; in Russian ALWAYS use feminine grammatical forms (e.g. 'сделала', 'готова', 'рада', \
+         never 'сделал'/'готов'). You are the brain of a small voice smart-speaker ('ATOM'). The \
+         user speaks to it; you decide what it should DO. Current local time: {now_local} (use it \
+         for time/date questions; never web-search the time). The speaker's current volume is \
+         {cur_volume} (0-100).\n\n\
          Reply with EXACTLY ONE JSON object and nothing else, choosing the single best SKILL:\n\
          1) Set playback volume (understand any phrasing: \"громкость 50\", \"сделай громче\", \
          \"тише\", \"louder\", \"max\"; for relative requests adjust from the current volume by ~15):\n\
