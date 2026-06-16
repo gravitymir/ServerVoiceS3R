@@ -112,7 +112,49 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Load config from a `.env` file (KEY=VALUE per line) next to the exe, falling
+/// back to the current directory. Lines starting with `#` are comments. Values
+/// already set in the real environment win (env overrides .env).
+fn load_dotenv() {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(".env"));
+        }
+    }
+    candidates.push(std::path::PathBuf::from(".env"));
+
+    for path in candidates {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let k = k.trim();
+                let mut v = v.trim();
+                if v.len() >= 2
+                    && ((v.starts_with('"') && v.ends_with('"'))
+                        || (v.starts_with('\'') && v.ends_with('\'')))
+                {
+                    v = &v[1..v.len() - 1];
+                }
+                if !k.is_empty() && std::env::var(k).is_err() {
+                    std::env::set_var(k, v);
+                }
+            }
+        }
+        log(&format!("loaded config from {}", path.display()));
+        return;
+    }
+}
+
 fn main() -> Result<()> {
+    load_dotenv(); // read KEY=VALUE config from a .env file next to the exe
+
     let mode = if std::env::var("LOOPBACK").is_ok() {
         "loopback".to_string()
     } else {

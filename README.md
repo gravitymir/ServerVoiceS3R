@@ -3,124 +3,147 @@
 PC-side voice-assistant server for the **M5Stack ATOM VoiceS3R** firmware
 ([VoiceS3R](https://github.com/gravitymir/VoiceS3R)).
 
-The device streams microphone audio to this server over raw TCP; the server turns
-it into a spoken reply and streams the audio back, which the device plays on its
-speaker.
+The device listens for its on-device wake word **"Sophia"** (or a button press),
+records what you say, and streams 16 kHz mono PCM to this server over raw TCP. The
+server turns it into a spoken reply (and/or a device command) and streams the
+audio back, which the device plays on its speaker.
 
 ```
-ATOM VoiceS3R  ──(hold button)── 16 kHz mono PCM ──TCP──▶  ServerVoiceS3R
-   speaker     ◀────────────────  16 kHz mono PCM ──TCP──   Whisper → GPT → TTS
+ATOM VoiceS3R  ──("Sophia" / button)── 16 kHz mono PCM ──TCP─▶  ServerVoiceS3R :9000
+   speaker     ◀──────────────────────  16 kHz mono PCM ──TCP──  STT → brain → TTS
 ```
+
+## Two programs
+
+This crate builds **two** executables:
+
+| Binary | Port | Role | Needed for |
+|---|---|---|---|
+| `server_voice_s3r.exe` | 9000 | **The brain.** Speech → STT → reply/skill → TTS → spoken audio back. Also handles volume + speaker-mode control and voice coding. | Always |
+| `pc_speaker.exe` | 9001 | **PC-audio streamer.** Captures the PC's audio output (WASAPI loopback) and streams it to the device so the ATOM plays your computer's sound. | Only for WiFi speaker mode |
+
+Run just the main server for the assistant; run both if you also want the device
+to act as a wireless speaker for the PC.
+
+## Quick start (recommended: `skills` mode)
+
+1. Build:
+   ```powershell
+   cargo build --release
+   ```
+2. Put a **`.env`** file next to the exe — `target\release\.env` — so you don't
+   pass settings on the command line each run (the server reads it automatically;
+   real environment variables override it):
+   ```ini
+   MODE=skills
+   OPENAI_API_KEY=<your-openai-api-key>
+   TTS_VOICE=nova
+   TTS_SPEED=1.4
+   CODE_DIR=C:/Users/you/voice-code
+   ```
+3. Start it:
+   ```powershell
+   .\target\release\server_voice_s3r.exe
+   # optional, for speaker mode:
+   .\target\release\pc_speaker.exe
+   ```
+4. The device must be on the **same LAN** and provisioned with this PC's
+   `IP:9000` (e.g. `192.168.8.100:9000`).
+
+## Modes (`MODE` env var)
+
+### `skills` (recommended) — smart agent, OpenAI voice
+**OpenAI Whisper** (STT, cloud) → **Claude CLI** brain that picks a *skill* →
+**OpenAI TTS** (e.g. the female `nova` voice). The brain understands the device:
+
+- **answer** — speak a concise reply (may use web search for live facts).
+- **volume** — set speaker volume ("set volume 50", "сделай громче").
+- **speaker** — enter WiFi speaker mode ("режим колонки"); can also set volume
+  in the same command.
+- **coding mode** — see below.
+
+Needs `OPENAI_API_KEY` (STT + TTS) and the [`claude` CLI](https://claude.com/claude-code) on `PATH`.
+
+### `windows` — fully local + Claude subscription (no API keys)
+Local **Whisper** (`stt_server.py`, or `STT_ENGINE=sapi` for Windows
+System.Speech) → `claude` CLI reply → **Windows SAPI** TTS.
+
+### `openai` — all-OpenAI
+OpenAI Whisper → Chat Completions → OpenAI TTS.
+
+### `loopback` (`LOOPBACK=1`) — no AI
+Echoes recorded audio back; proves the mic → TCP → speaker round-trip.
+
+## Voice coding mode (M6)
+
+In `skills` mode, say **"coding mode"** to route every spoken command to a
+**persistent Claude Code session** rooted in `CODE_DIR`
+(`claude -p --continue --dangerously-skip-permissions`). It can read/edit/create
+files and run commands, and remembers context across commands. Say
+**"exit coding mode"** to return to the normal assistant.
+
+The agent is told it's a hands-free voice session — the user is across the room
+and usually isn't watching the screen — so it replies with **one short, informative
+sentence** and only points you to the screen at milestones (e.g. a browser result).
+
+> ⚠️ **Autonomy / safety:** `--dangerously-skip-permissions` lets the agent run
+> any file/shell action **without confirmation**. Point `CODE_DIR` only at a
+> project you're comfortable letting voice commands modify (the default is a
+> sandbox folder).
+
+## WiFi speaker mode
+
+`pc_speaker.exe` (port 9001) loopback-captures the PC's **default output device**
+and streams it to the device. Pick the device with `SPEAKER_DEVICE` (a name
+substring) if the default isn't the one you hear:
+
+```powershell
+$env:SPEAKER_DEVICE="Speakers"   # optional; else uses the system default
+.\target\release\pc_speaker.exe
+```
+
+Say "режим колонки" / "speaker mode" to the device to start; press the button to exit.
+
+## Configuration
+
+The server reads a **`.env`** file next to the exe (then `./.env`), `KEY=VALUE`
+per line, `#` comments; real environment variables take precedence.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MODE` | `windows` | `skills` \| `windows` \| `openai` \| `loopback` |
+| `OPENAI_API_KEY` | — | Required for `skills` and `openai` (STT + TTS) |
+| `PORT` | `9000` | TCP listen port |
+| `TTS_VOICE` | `alloy` | OpenAI TTS voice (`nova`, `shimmer`, `coral`, …) |
+| `TTS_SPEED` | `1.3` | Speech rate (0.25–4.0; higher = faster) |
+| `CODE_DIR` | `C:/Users/gravi/voice-code` | Project folder for voice coding mode (M6) |
+| `STT_MODEL` | `whisper-1` | OpenAI transcription model |
+| `CHAT_MODEL` | `gpt-4o-mini` | (openai mode) reply model |
+| `TTS_MODEL` | `gpt-4o-mini-tts` | OpenAI speech model |
+| `STT_ENGINE` | `whisper` | (windows mode) `whisper` \| `sapi` |
+| `STT_URL` | `http://127.0.0.1:9100/stt` | local Whisper microservice endpoint |
+| `SPEAKER_DEVICE` | (default device) | (pc_speaker) output device name substring |
+| `LOOPBACK` | unset | If set, forces loopback mode |
 
 ## Protocol
 
 One TCP connection per utterance:
 
-1. The device connects and streams **16 kHz, mono, 16-bit little-endian PCM**
-   while its button is held.
-2. On button release the device half-closes its write side (EOF) to mark the end
-   of the utterance.
-3. The server transcribes → generates a reply → synthesizes speech, then streams
-   **16 kHz mono s16le PCM** back and closes the connection.
+1. The device streams **16 kHz, mono, 16-bit little-endian PCM**, then half-closes
+   its write side (EOF) to mark the end of the utterance.
+2. The server replies with a **1-byte control header** then response PCM:
+   `0xFF` = no change · `0x00..=100` = set volume · `0xFE` = enter speaker mode ·
+   `128..=228` = set volume *and* enter speaker mode.
+3. The device applies the control byte and plays the PCM.
 
-## Modes
+## Firewall
 
-Selected with the `MODE` env var (default `windows`); `LOOPBACK=1` forces loopback.
-
-### Windows (default — no API keys)
-
-Fully local + your Claude subscription:
-
-- **STT** — local **Whisper** via `stt_server.py` (accurate; default). Set
-  `STT_ENGINE=sapi` to use the Windows `System.Speech` recognizer instead (pure
-  Windows, no Python, but much less accurate).
-- **Reply** — the `claude` CLI (`claude -p`, prompt piped on stdin)
-- **TTS** — Windows SAPI (`System.Speech.Synthesis`), 16 kHz mono
-
-Start the Whisper STT microservice first (loads the model once), then the server:
-
-```powershell
-# 1) STT service — use a Python env that has openai-whisper + numpy:
-C:\path\to\.venv\Scripts\python.exe stt_server.py base.en
-
-# 2) the server (MODE + STT_ENGINE default to windows + whisper):
-cargo run --release
-```
-
-Requires the [`claude` CLI](https://claude.com/claude-code) on `PATH`. Round-trip
-is ~6–10 s. Volume voice commands ("set volume 50") are recognized server-side
-and pushed to the device via a 1-byte control header before the audio.
-
-### Loopback (no API key)
-
-Echoes the recorded audio straight back — proves the full
-mic → TCP → speaker round-trip without any cloud calls.
-
-```powershell
-$env:LOOPBACK = "1"
-cargo run --release
-```
-
-### OpenAI (Whisper + Chat + TTS)
-
-Set your key and run:
-
-```powershell
-setx OPENAI_API_KEY "sk-..."   # once; reopen the terminal afterwards
-cargo run --release
-```
-
-Pipeline: OpenAI **Whisper** (speech-to-text) → **Chat Completions** (reply) →
-**TTS** (24 kHz PCM, resampled to 16 kHz for the device).
-
-## Configuration (environment variables)
-
-| Variable         | Default            | Purpose                                   |
-|------------------|--------------------|-------------------------------------------|
-| `MODE`           | `windows`          | `windows` \| `openai` \| `loopback`       |
-| `STT_ENGINE`     | `whisper`          | (windows mode) `whisper` \| `sapi`        |
-| `STT_URL`        | `http://127.0.0.1:9100/stt` | Whisper STT microservice endpoint |
-| `LOOPBACK`       | unset              | If set, forces loopback mode              |
-| `OPENAI_API_KEY` | —                  | Required for `MODE=openai`                |
-| `PORT`           | `9000`             | TCP listen port                           |
-| `STT_MODEL`      | `whisper-1`        | Transcription model                       |
-| `CHAT_MODEL`     | `gpt-4o-mini`      | Reply model                               |
-| `TTS_MODEL`      | `gpt-4o-mini-tts`  | Speech model                              |
-| `TTS_VOICE`      | `alloy`            | TTS voice                                 |
-
-## Running
-
-```powershell
-cargo build --release
-$env:LOOPBACK = "1"; .\target\release\server_voice_s3r.exe
-```
-
-The device must be on the **same LAN** and provisioned with this PC's IP and port
-(e.g. `192.168.8.100:9000`). On Windows, allow the app through the firewall
-(Private networks) the first time, or pre-create the rule:
+Allow the server through the Windows firewall (Private networks) the first time,
+or pre-create the rule:
 
 ```powershell
 New-NetFirewallRule -DisplayName "VoiceS3R 9000" -Direction Inbound -LocalPort 9000 -Protocol TCP -Action Allow
 ```
-
-### Example log
-
-```
-[  0.00s] listening on 0.0.0.0:9000
-[  0.00s] waiting for the ATOM VoiceS3R to connect (hold its button to talk)...
-[ 12.34s] ── connection from 192.168.8.132:62600 ──
-[ 12.78s] [recv] 96000 bytes (~3.0s of 16kHz mono)
-[ 13.91s] [stt] "what's the weather like"
-[ 14.65s] [llm] "I can't check live weather, but I can help with..."
-[ 15.80s] [tts] 144000 bytes @24k -> 96000 bytes @16k
-[ 15.85s] [done] total 3.51s
-```
-
-## Roadmap
-
-- Better local STT (whisper.cpp / `faster-whisper`) to replace the modest Windows
-  recognizer — see the companion experiment in `rust_wthisper`.
-- Streaming/partial responses to cut the round-trip latency.
 
 ## License
 

@@ -1,4 +1,9 @@
 /target
 *.log
-.env
 debug_last.*
+
+# Secrets / local config — never commit (esp. the .env next to the exe that
+# holds OPENAI_API_KEY). Ignore .env anywhere in the tree.
+.env
+*.env
+**/.env
