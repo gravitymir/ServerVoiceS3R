@@ -10,7 +10,7 @@
 //!   - `windows`  : Windows System.Speech STT + `claude` CLI reply + SAPI TTS.
 //!   - `openai`   : OpenAI Whisper + Chat + TTS (needs OPENAI_API_KEY).
 //!
-//! Other env: PORT (9000), CHAT_MODEL, TTS_MODEL, TTS_VOICE, STT_MODEL.
+//! Other env: PORT (9000), CHAT_MODEL, TTS_MODEL, TTS_VOICE_SOPHIA, TTS_VOICE_JARVIS, STT_MODEL.
 
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -39,11 +39,34 @@ static CODING_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Whether the current coding-mode session has been started (controls --continue).
 static CODING_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Continuous transcribe mode: while true, each utterance is transcribed + printed
+/// (no LLM, no spoken reply). Entered by voice, left by the device's button marker
+/// or by TRANSCRIBE_TIMEOUT seconds of no speech.
+static TRANSCRIBE_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Timestamp of the last actual speech in transcribe mode (for the idle timeout).
+static TRANSCRIBE_LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Device→server header bit (OR'd into the persona byte): "button pressed — leave
+/// transcribe mode". The accompanying utterance is empty.
+const HDR_TRANSCRIBE_EXIT: u8 = 0x80;
 
 /// Control byte sent before the PCM: 0xFF = no change, 0..=100 = set volume,
-/// 0xFE = enter speaker mode (device connects to the pc_speaker stream).
+/// 0xFE = enter speaker mode (device connects to the pc_speaker stream),
+/// 0xFD = stay in continuous transcribe mode (record the next utterance with no
+/// wake word). Anything else while transcribing means "leave transcribe mode".
 const CTRL_NONE: u8 = 0xFF;
 const CTRL_SPEAKER: u8 = 0xFE;
+const CTRL_TRANSCRIBE: u8 = 0xFD;
+/// Start a STREAMING transcribe session: the device opens one long-lived
+/// connection to TRANSCRIBE_STREAM_PORT and pushes the mic continuously; the
+/// server segments + transcribes it. LOCAL = on-PC Whisper, EXTERNAL = OpenAI.
+const CTRL_STREAM_LOCAL: u8 = 0xFC;
+const CTRL_STREAM_EXTERNAL: u8 = 0xFB;
+/// Port the device streams the mic to for streaming transcription.
+const TRANSCRIBE_STREAM_PORT: u16 = 9002;
+/// Device→server stream header bit: external backend (else local).
+const STREAM_BACKEND_EXTERNAL: u8 = 0x80;
 
 /// What to send back to the device.
 struct Response {
@@ -95,7 +118,7 @@ struct Config {
     port: u16,
     chat_model: String,
     tts_model: String,
-    tts_voice: String,
+    tts_voice_sophia: String,
     stt_model: String,
     mode: String,
     stt_engine: String, // "sapi" (Windows System.Speech) | "whisper" (local HTTP)
@@ -106,6 +129,54 @@ struct Config {
     agent: bool, // allow voice commands to run PC actions (with spoken confirmation)
     debug_wav: bool,
     code_dir: String, // project folder for voice "coding mode" (M6)
+    tts_voice_jarvis: String, // OpenAI TTS voice for the male "Jarvis" persona
+    transcribe_timeout_secs: u64, // auto-leave transcribe mode after this much silence
+    realtime_model: String, // OpenAI Realtime transcription model (external streaming)
+    realtime_silence_ms: u64, // server-VAD silence before a segment ends (Realtime)
+    whisper_model: String, // local whisper.cpp model size (tiny/base/small/medium/large-v3)
+    whisper_language: String, // local whisper language hint ("" = auto-detect)
+}
+
+/// Which on-device wake word fired (sent as the first request byte). Selects the
+/// spoken voice and the persona injected into the brain/coding prompts.
+const PERSONA_SOPHIA: u8 = 0;
+const PERSONA_JARVIS: u8 = 1;
+
+struct Persona {
+    name: &'static str,
+    voice: String, // OpenAI TTS voice for this persona
+    skills_intro: &'static str,
+    coding_intro: &'static str,
+}
+
+impl Persona {
+    fn from_byte(b: u8, cfg: &Config) -> Persona {
+        // PERSONA_SOPHIA is the default for anything that isn't explicitly Jarvis.
+        let _ = PERSONA_SOPHIA;
+        if b == PERSONA_JARVIS {
+            Persona {
+                name: "Jarvis",
+                voice: cfg.tts_voice_jarvis.clone(),
+                skills_intro: "You are Jarvis, a calm, capable MALE voice assistant — always speak \
+                    about yourself as a man; in Russian ALWAYS use masculine grammatical forms (e.g. \
+                    'сделал', 'готов', 'рад', never 'сделала'/'готова').",
+                coding_intro: "You are Jarvis, a hands-free MALE voice coding assistant in this \
+                    project directory (always speak about yourself as a man; in Russian ALWAYS use \
+                    masculine forms like 'сделал', 'запустил', 'готов', never feminine).",
+            }
+        } else {
+            Persona {
+                name: "Sophia",
+                voice: cfg.tts_voice_sophia.clone(),
+                skills_intro: "You are Sophia, a warm, friendly FEMALE voice assistant — always speak \
+                    about yourself as a woman; in Russian ALWAYS use feminine grammatical forms (e.g. \
+                    'сделала', 'готова', 'рада', never 'сделал'/'готов').",
+                coding_intro: "You are Sophia, a hands-free FEMALE voice coding assistant in this \
+                    project directory (always speak about yourself as a woman; in Russian ALWAYS use \
+                    feminine forms like 'сделала', 'запустила', 'готова', never masculine).",
+            }
+        }
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -175,7 +246,7 @@ fn main() -> Result<()> {
         port: env_or("PORT", "9000").parse().unwrap_or(9000),
         chat_model: env_or("CHAT_MODEL", "gpt-4o-mini"),
         tts_model: env_or("TTS_MODEL", "gpt-4o-mini-tts"),
-        tts_voice: env_or("TTS_VOICE", "alloy"),
+        tts_voice_sophia: env_or("TTS_VOICE_SOPHIA", "nova"),
         stt_model: env_or("STT_MODEL", "whisper-1"),
         mode,
         stt_engine: env_or("STT_ENGINE", "whisper").to_lowercase(),
@@ -186,6 +257,12 @@ fn main() -> Result<()> {
         agent: env_or("AGENT", "1") != "0",
         debug_wav: std::env::var("DEBUG_WAV").is_ok(),
         code_dir: env_or("CODE_DIR", "C:/Users/gravi/voice-code"),
+        tts_voice_jarvis: env_or("TTS_VOICE_JARVIS", "onyx"),
+        transcribe_timeout_secs: env_or("TRANSCRIBE_TIMEOUT", "60").parse().unwrap_or(60),
+        realtime_model: env_or("REALTIME_MODEL", "gpt-4o-transcribe"),
+        realtime_silence_ms: env_or("REALTIME_SILENCE_MS", "1500").parse().unwrap_or(1500),
+        whisper_model: env_or("WHISPER_MODEL", "small"),
+        whisper_language: env_or("WHISPER_LANGUAGE", "").trim().to_lowercase(),
     };
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -202,15 +279,16 @@ fn main() -> Result<()> {
         }
         "openai" => log(&format!(
             "OpenAI: stt={} chat={} tts={} voice={}",
-            cfg.stt_model, cfg.chat_model, cfg.tts_model, cfg.tts_voice
+            cfg.stt_model, cfg.chat_model, cfg.tts_model, cfg.tts_voice_sophia
         )),
         "skills" => {
             std::fs::create_dir_all(&cfg.code_dir).ok();
             log(&format!(
                 "Skills agent: STT=OpenAI {} | brain=claude CLI (web search) | TTS=OpenAI {} voice={}",
-                cfg.stt_model, cfg.tts_model, cfg.tts_voice
+                cfg.stt_model, cfg.tts_model, cfg.tts_voice_sophia
             ));
             log(&format!("Coding mode (M6) project dir: {}", cfg.code_dir));
+            log(&format!("Transcribe mode idle timeout: {}s", cfg.transcribe_timeout_secs));
         }
         "loopback" => log("echoing recorded audio back (no AI)"),
         other => log(&format!("WARNING: unknown MODE '{other}'")),
@@ -219,6 +297,28 @@ fn main() -> Result<()> {
     log("waiting for the ATOM VoiceS3R to connect (hold its button to talk)...");
 
     let cfg = std::sync::Arc::new(cfg);
+
+    // Streaming-transcribe listener (port 9002): one long-lived connection per
+    // session; the device pushes the mic continuously and we segment + transcribe.
+    {
+        let cfg = cfg.clone();
+        let addr2 = format!("0.0.0.0:{}", TRANSCRIBE_STREAM_PORT);
+        std::thread::spawn(move || match TcpListener::bind(&addr2) {
+            Ok(l) => {
+                log(&format!("transcribe stream listening on {addr2}"));
+                for s in l.incoming().flatten() {
+                    let cfg = cfg.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = transcribe_stream_handler(s, cfg) {
+                            log(&format!("[stream error] {e:#}"));
+                        }
+                    });
+                }
+            }
+            Err(e) => log(&format!("[stream] bind {addr2} failed: {e}")),
+        });
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -241,12 +341,60 @@ fn main() -> Result<()> {
 fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
     let t0 = Instant::now();
 
-    // 1. Receive the whole utterance (until the device half-closes).
+    // 1. Receive: 1 header byte + the whole utterance PCM (until the device
+    //    half-closes). Header: low 7 bits = persona (wake word), bit 0x80 =
+    //    "button pressed — leave transcribe mode" (the utterance is then empty).
+    let mut head = [0u8; 1];
+    if stream.read_exact(&mut head).is_err() {
+        log("[skip] empty connection (no header byte)");
+        return Ok(());
+    }
+    let exit_transcribe = head[0] & HDR_TRANSCRIBE_EXIT != 0;
+    let persona = Persona::from_byte(head[0] & 0x7F, cfg);
+
     let mut pcm = Vec::new();
     stream.read_to_end(&mut pcm).context("reading utterance PCM")?;
+
+    // Button exit from transcribe mode: clear state, confirm, done.
+    if exit_transcribe {
+        TRANSCRIBE_MODE.store(false, Ordering::Relaxed);
+        log("[transcribe] exit (button) — back to wake-word listening");
+        let pcm = transcribe_off_pcm(cfg, &persona);
+        stream.write_all(&[CTRL_NONE]).ok();
+        if !pcm.is_empty() {
+            stream.write_all(&pcm).ok();
+        }
+        stream.flush().ok();
+        return Ok(());
+    }
+
+    // Idle timeout: if transcribe mode has gone quiet for TRANSCRIBE_TIMEOUT
+    // seconds (no actual speech), leave it on the next utterance.
+    if TRANSCRIBE_MODE.load(Ordering::Relaxed) {
+        let idle = TRANSCRIBE_LAST
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        if idle >= cfg.transcribe_timeout_secs {
+            TRANSCRIBE_MODE.store(false, Ordering::Relaxed);
+            log(&format!("[transcribe] auto-exit after {idle}s of silence"));
+            let pcm = transcribe_off_pcm(cfg, &persona);
+            stream.write_all(&[CTRL_NONE]).ok();
+            if !pcm.is_empty() {
+                stream.write_all(&pcm).ok();
+            }
+            stream.flush().ok();
+            return Ok(());
+        }
+    }
+
     let secs = pcm.len() as f32 / (DEVICE_RATE as f32 * 2.0);
     log(&format!(
-        "[recv] {} bytes (~{:.1}s of 16kHz mono) in {:?}",
+        "[persona] {} (voice {}){}  |  [recv] {} bytes (~{:.1}s) in {:?}",
+        persona.name,
+        persona.voice,
+        if TRANSCRIBE_MODE.load(Ordering::Relaxed) { " [transcribe]" } else { "" },
         pcm.len(),
         secs,
         t0.elapsed()
@@ -273,7 +421,8 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         }
         "windows" => windows_brain(&pcm, cfg)?,
         "openai" => openai_brain(&pcm, cfg)?,
-        "skills" => skills_brain(&pcm, cfg)?,
+        "skills" if TRANSCRIBE_MODE.load(Ordering::Relaxed) => transcribe_turn(&pcm, cfg)?,
+        "skills" => skills_brain(&pcm, cfg, &persona)?,
         other => {
             log(&format!("[error] unknown MODE '{other}'"));
             return Ok(());
@@ -285,10 +434,14 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // 3. Send: 1 control byte (0xFF none, 0..=100 volume, 0xFE speaker) + PCM.
+    // 3. Send: 1 control byte (0xFF none, 0..=100 volume, 0xFE speaker,
+    //    0xFD continuous transcribe) + PCM.
     match resp.control {
         CTRL_NONE => {}
         CTRL_SPEAKER => log("[control] -> enter speaker mode"),
+        CTRL_TRANSCRIBE => log("[control] -> transcribe (keep listening)"),
+        CTRL_STREAM_LOCAL => log("[control] -> streaming transcribe (local)"),
+        CTRL_STREAM_EXTERNAL => log("[control] -> streaming transcribe (external)"),
         v => log(&format!("[control] -> volume {v}")),
     }
     stream.write_all(&[resp.control]).context("writing control header")?;
@@ -582,6 +735,530 @@ fn run_claude(prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+// ───────────────────────── Transcribe mode ─────────────────────────────────
+//
+// A pure voice-to-text mode: say "transcribe mode" and from then on every
+// utterance is just transcribed and PRINTED in the terminal (and copied to the
+// Windows clipboard so you can paste it into any other app/website). Nothing is
+// sent to the LLM and nothing is spoken back. Say "exit transcribe mode" to leave.
+
+/// True if the text is about transcription/stenography/dictation (any language/
+/// form). Broad `транскри` stem because Whisper writes "транскрипции".
+fn transcribe_topic(t: &str) -> bool {
+    t.contains("transcrib")
+        || t.contains("voice to text")
+        || t.contains("dictation")
+        || t.contains("транскри")
+        || t.contains("стеногра")
+        || t.contains("диктов")
+        || t.contains("голос в текст")
+}
+
+/// Streaming transcribe with LOCAL processing ("локальная стенограмма" etc.).
+fn is_local_transcribe(t: &str) -> bool {
+    let t = t.to_lowercase();
+    transcribe_topic(&t) && (t.contains("локаль") || t.contains("local")
+        || t.contains("внутренн") || t.contains("internal"))
+}
+
+/// Streaming transcribe with EXTERNAL/cloud processing ("внешняя транскрибация").
+fn is_external_transcribe(t: &str) -> bool {
+    let t = t.to_lowercase();
+    transcribe_topic(&t) && (t.contains("внешн") || t.contains("external"))
+}
+
+fn is_transcribe_enter(t: &str) -> bool {
+    transcribe_topic(&t.to_lowercase())
+}
+
+/// One continuous-transcribe utterance. Transcribe it, print it, copy it to the
+/// clipboard — no LLM, no spoken reply. Non-empty speech refreshes the idle
+/// timer. Returns CTRL_TRANSCRIBE so the device keeps recording; the mode is left
+/// only by the device button (header bit) or the idle timeout (both in `handle`).
+fn transcribe_turn(pcm: &[u8], cfg: &Config) -> Result<Response> {
+    let client = reqwest::blocking::Client::new();
+    let t = Instant::now();
+    let wav = pcm_to_wav(pcm, DEVICE_RATE);
+    let transcript = transcribe(&client, cfg, wav)?.trim().to_string();
+    log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
+    if !transcript.is_empty() {
+        *TRANSCRIBE_LAST.lock().unwrap() = Some(Instant::now()); // refresh idle timer
+        log("");
+        log(&format!("📝 TRANSCRIPT ─────────────────────────────\n{transcript}\n────────────────────────────────────────────"));
+        let copied = copy_to_clipboard(&transcript);
+        log(&format!("[transcribe] {} chars{}", transcript.chars().count(),
+            if copied { " — copied to clipboard" } else { " (clipboard copy failed)" }));
+    }
+    // Silent reply; CTRL_TRANSCRIBE = device records the next utterance.
+    Ok(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() })
+}
+
+/// The spoken "leaving transcribe mode" confirmation (skills mode only; empty
+/// otherwise). Played by the device on a button exit or an idle timeout.
+fn transcribe_off_pcm(cfg: &Config, persona: &Persona) -> Vec<u8> {
+    if cfg.mode != "skills" {
+        return Vec::new();
+    }
+    let client = reqwest::blocking::Client::new();
+    openai_tts(&client, cfg, &persona.voice, "Transcribe mode off.").unwrap_or_default()
+}
+
+/// Copy text to the Windows clipboard as UTF-8 (handles Cyrillic correctly, which
+/// piping through `clip.exe` does not). Writes a temp file and lets PowerShell
+/// read it back as UTF-8 into Set-Clipboard. Best-effort; returns success.
+fn copy_to_clipboard(text: &str) -> bool {
+    let tmp = std::env::temp_dir().join("s3r_transcript.txt");
+    if std::fs::write(&tmp, text).is_err() {
+        return false;
+    }
+    let cmd = format!(
+        "Set-Clipboard -Value (Get-Content -Raw -Encoding UTF8 -LiteralPath '{}')",
+        tmp.display()
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Print one finished transcript segment: ONLY the spoken text, on its own line
+/// (each segment follows a pause, so this gives one line per pause). No
+/// timestamps or framing. Junk/empty segments are dropped. Also copies to clipboard.
+fn print_transcript(text: &str) {
+    let text = text.trim();
+    if !is_meaningful_transcript(text) {
+        return;
+    }
+    println!("{text}");
+    let _ = std::io::stdout().flush();
+    copy_to_clipboard(text);
+}
+
+/// Filter out empty / punctuation-only segments and Whisper's well-known
+/// silence hallucinations (it emits "." or stock phrases on near-silence).
+/// True if the text contains characters from a script we don't expect (CJK,
+/// Hangul, Thai, Arabic, Hebrew, Devanagari…). Used to drop Whisper's foreign-
+/// language hallucinations on noise — we only ever dictate Russian or English.
+fn has_foreign_script(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c as u32,
+            0x0590..=0x05FF | // Hebrew
+            0x0600..=0x06FF | // Arabic
+            0x0900..=0x097F | // Devanagari
+            0x0E00..=0x0E7F | // Thai
+            0x1100..=0x11FF | // Hangul Jamo
+            0x3040..=0x30FF | // Hiragana + Katakana
+            0x3400..=0x4DBF | // CJK Ext A
+            0x4E00..=0x9FFF | // CJK Unified
+            0xAC00..=0xD7AF | // Hangul syllables
+            0xFF00..=0xFFEF)  // halfwidth/fullwidth forms
+    })
+}
+
+fn is_meaningful_transcript(t: &str) -> bool {
+    let t = t.trim();
+    if t.is_empty() || t.chars().all(|c| !c.is_alphanumeric()) {
+        return false;
+    }
+    if has_foreign_script(t) {
+        return false;
+    }
+    const JUNK: &[&str] = &[
+        "ご視聴ありがとうございました",
+        "продолжение следует",
+        "субтитры сделал",
+        "субтитры создавал",
+        "спасибо за просмотр",
+        "thanks for watching",
+        "thank you for watching",
+        "please subscribe",
+    ];
+    let low = t.to_lowercase();
+    !JUNK.iter().any(|j| low.contains(j))
+}
+
+// ───────────────────── Streaming transcribe (port 9002) ─────────────────────
+//
+// The device opens ONE long-lived connection and pushes the mic continuously.
+// We segment the stream by energy (server-side VAD) and transcribe each segment
+// off the read path (a worker thread), so reading never stalls and no audio is
+// lost between sentences. The session ends when the device closes the stream
+// (button press).
+
+fn transcribe_stream_handler(mut stream: TcpStream, cfg: std::sync::Arc<Config>) -> Result<()> {
+    let mut head = [0u8; 1];
+    if stream.read_exact(&mut head).is_err() {
+        return Ok(());
+    }
+    let external = head[0] & STREAM_BACKEND_EXTERNAL != 0;
+    let persona = Persona::from_byte(head[0] & 0x7F, &cfg);
+    log(&format!(
+        "[stream] transcribe session start (persona {}, {})",
+        persona.name,
+        if external { "external" } else { "local" }
+    ));
+    if external {
+        // True OpenAI Realtime (word-by-word). If the websocket can't be
+        // established — bad/expired/missing API key, no access, network down —
+        // we can't reach OpenAI at all, so fall back to the LOCAL model instead.
+        match realtime_connect(&cfg) {
+            Ok(ws) => stream_realtime_pump(stream, ws, debug_realtime())?,
+            Err(e) => {
+                log("[stream] ⚠ External transcription (OpenAI) unavailable — \
+                     check the API key (missing / wrong / expired) or your network/access.");
+                log(&format!("[stream]   reason: {e:#}"));
+                log("[stream] → falling back to the LOCAL model (needs stt_server.py on STT_URL).");
+                stream_segment_loop(stream, cfg)?;
+            }
+        }
+    } else {
+        stream_segment_loop(stream, cfg)?;
+    }
+    log("[stream] transcribe session ended");
+    Ok(())
+}
+
+/// Read the continuous PCM stream, split into speech segments by energy, and hand
+/// each segment to a worker thread for STT + printing (so the read loop never
+/// blocks on the network STT call → no dropped audio).
+fn stream_segment_loop(mut stream: TcpStream, cfg: std::sync::Arc<Config>) -> Result<()> {
+    const SPEECH_PEAK: i32 = 350; // quiet floor ~40, speech ~1000+
+    const SILENCE_END_BYTES: usize = 25_600; // ~0.8s of trailing silence ends a segment (16k*2)
+    const MAX_SEG_BYTES: usize = 960_000; // 30s hard cap
+    const MIN_SEG_BYTES: usize = 8_000; // ~0.25s — skip clicks/blips
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let cfgw = cfg.clone();
+    let worker = std::thread::spawn(move || {
+        for seg in rx {
+            let text = whisper_transcribe(&cfgw, &seg).unwrap_or_default();
+            print_transcript(&text); // prints ONLY the spoken text, one line per segment
+        }
+    });
+
+    let mut buf = [0u8; 2048];
+    let mut acc: Vec<u8> = Vec::new(); // current segment
+    let mut prev: Vec<u8> = Vec::new(); // last chunk, prepended on speech onset
+    let mut spoke = false;
+    let mut silence_bytes = 0usize;
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break, // device closed (button) or error
+            Ok(n) => n,
+        };
+        let chunk = &buf[..n];
+        let mut peak = 0i32;
+        for s in chunk.chunks_exact(2) {
+            let v = (i16::from_le_bytes([s[0], s[1]]) as i32).abs();
+            if v > peak {
+                peak = v;
+            }
+        }
+        if peak > SPEECH_PEAK {
+            if !spoke {
+                acc.extend_from_slice(&prev); // pre-roll so the word onset isn't clipped
+            }
+            spoke = true;
+            silence_bytes = 0;
+            acc.extend_from_slice(chunk);
+        } else if spoke {
+            acc.extend_from_slice(chunk);
+            silence_bytes += n;
+            if silence_bytes >= SILENCE_END_BYTES || acc.len() >= MAX_SEG_BYTES {
+                if acc.len() >= MIN_SEG_BYTES {
+                    tx.send(std::mem::take(&mut acc)).ok();
+                } else {
+                    acc.clear();
+                }
+                spoke = false;
+                silence_bytes = 0;
+            }
+        }
+        prev.clear();
+        prev.extend_from_slice(chunk);
+    }
+    if spoke && acc.len() >= MIN_SEG_BYTES {
+        tx.send(acc).ok(); // flush trailing segment
+    }
+    drop(tx);
+    let _ = worker.join();
+    Ok(())
+}
+
+/// Local in-process speech-to-text via whisper.cpp (whisper-rs) — NO Python, NO
+/// external process. The model file is downloaded once on first use.
+fn whisper_transcribe(cfg: &Config, pcm: &[u8]) -> Result<String> {
+    let ctx = whisper_ctx(cfg).ok_or_else(|| anyhow!("local whisper model unavailable"))?;
+    let ctx = ctx.lock().unwrap();
+    let mut state = ctx.create_state().map_err(|e| anyhow!("whisper state: {e}"))?;
+
+    // i16 LE @16 kHz -> f32 mono, normalized to -1..1 (what whisper.cpp expects).
+    let mut audio: Vec<f32> = pcm
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect();
+    // whisper.cpp rejects clips shorter than 1s — pad with trailing silence.
+    if audio.len() < 16_000 {
+        audio.resize(16_000, 0.0);
+    }
+
+    // Language: explicit "auto" when unset, so it detects RU/EN per utterance.
+    // (whisper.cpp's default is English, which would translate Russian to English!)
+    let lang = if cfg.whisper_language.is_empty() {
+        "auto".to_string()
+    } else {
+        cfg.whisper_language.clone()
+    };
+    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_translate(false); // transcribe in the spoken language, do NOT translate
+    params.set_language(Some(&lang));
+    state.full(params, &audio).map_err(|e| anyhow!("whisper full: {e}"))?;
+
+    let n = state.full_n_segments().map_err(|e| anyhow!("whisper segments: {e}"))?;
+    let mut out = String::new();
+    for i in 0..n {
+        if let Ok(seg) = state.full_get_segment_text(i) {
+            out.push_str(&seg);
+        }
+    }
+    Ok(out.trim().to_string())
+}
+
+/// Lazily load the whisper.cpp model (downloading it on first use). Returns the
+/// shared context, or None if it couldn't be obtained/loaded (logged once).
+fn whisper_ctx(cfg: &Config) -> Option<&'static std::sync::Mutex<whisper_rs::WhisperContext>> {
+    static WHISPER: std::sync::OnceLock<Option<std::sync::Mutex<whisper_rs::WhisperContext>>> =
+        std::sync::OnceLock::new();
+    WHISPER
+        .get_or_init(|| {
+            // Route whisper.cpp/ggml's chatty stderr logs into the `log` crate
+            // (no logger installed -> silenced), keeping our transcript clean.
+            whisper_rs::install_logging_hooks();
+            match ensure_whisper_model(cfg) {
+            Ok(path) => {
+                log(&format!("[whisper] loading local model: {}", path.display()));
+                let p = path.to_string_lossy().into_owned();
+                match whisper_rs::WhisperContext::new_with_params(
+                    &p,
+                    whisper_rs::WhisperContextParameters::default(),
+                ) {
+                    Ok(c) => {
+                        log("[whisper] local model ready");
+                        Some(std::sync::Mutex::new(c))
+                    }
+                    Err(e) => {
+                        log(&format!("[whisper] failed to load model: {e}"));
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!("[whisper] model unavailable: {e:#}"));
+                None
+            }
+            }
+        })
+        .as_ref()
+}
+
+/// Path to the ggml model next to the exe (models/ggml-<size>.bin), downloading
+/// it from Hugging Face on first use.
+fn ensure_whisper_model(cfg: &Config) -> Result<PathBuf> {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("models");
+    std::fs::create_dir_all(&dir).ok();
+    let file = format!("ggml-{}.bin", cfg.whisper_model);
+    let path = dir.join(&file);
+    if path.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false) {
+        return Ok(path); // already downloaded
+    }
+    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}");
+    log(&format!("[whisper] downloading local model '{file}' (one-time) — this may take a few minutes…"));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .build()?;
+    let mut resp = client.get(&url).send().context("download whisper model")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("model download HTTP {} ({url})", resp.status()));
+    }
+    let tmp = dir.join(format!("{file}.part"));
+    let mut out = std::fs::File::create(&tmp)?;
+    let n = std::io::copy(&mut resp, &mut out)?;
+    drop(out);
+    std::fs::rename(&tmp, &path)?;
+    log(&format!("[whisper] model downloaded ({:.0} MB) -> {}", n as f64 / 1_000_000.0, path.display()));
+    Ok(path)
+}
+
+type RealtimeWs = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+
+fn debug_realtime() -> bool {
+    // On only for a truthy value — `REALTIME_DEBUG=0` (or false/no/off/empty,
+    // or unset) means OFF, so the terminal shows only the dictated text.
+    match std::env::var("REALTIME_DEBUG") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off"),
+        Err(_) => false,
+    }
+}
+
+/// Open the OpenAI Realtime transcription websocket and configure the session.
+/// Returns the connected socket (does NOT touch the device stream, so the caller
+/// can cleanly fall back to per-segment STT if this fails).
+fn realtime_connect(cfg: &Config) -> Result<RealtimeWs> {
+    use tungstenite::client::IntoClientRequest;
+    use tungstenite::Message;
+
+    // GA API (the Beta shape with the `OpenAI-Beta: realtime=v1` header is disabled).
+    let url = "wss://api.openai.com/v1/realtime?intent=transcription";
+    let mut req = url.into_client_request().context("build Realtime request")?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {}", cfg.api_key).parse()?);
+    let (mut ws, _resp) = tungstenite::connect(req).context("connect OpenAI Realtime")?;
+    log(&format!("[stream] Realtime connected (model {})", cfg.realtime_model));
+
+    // GA-shape transcription session: audio config lives under session.audio.input;
+    // input format is a typed object (24 kHz PCM); server VAD does the segmenting.
+    let setup = serde_json::json!({
+        "type": "session.update",
+        "session": {
+            "type": "transcription",
+            "audio": {
+                "input": {
+                    "format": { "type": "audio/pcm", "rate": 24000 },
+                    "transcription": { "model": cfg.realtime_model,
+                        "prompt": "The audio is spoken in Russian or English only. \
+                                   In Russian, use the letter ё where it belongs (её, ещё, всё, ёлка)." },
+                    "turn_detection": { "type": "server_vad", "threshold": 0.5,
+                        "prefix_padding_ms": 300, "silence_duration_ms": cfg.realtime_silence_ms }
+                }
+            }
+        }
+    });
+    ws.send(Message::Text(setup.to_string())).context("Realtime session.update")?;
+    Ok(ws)
+}
+
+/// EXTERNAL streaming backend: pump the device's mic (resampled 16→24 kHz, base64)
+/// into `input_audio_buffer.append` while reading transcription events. OpenAI's
+/// server-side VAD segments the speech; we print deltas live (word-by-word) and a
+/// newline when each utterance completes. Set REALTIME_DEBUG=1 to log every event.
+fn stream_realtime_pump(mut device: TcpStream, mut ws: RealtimeWs, debug: bool) -> Result<()> {
+    use base64::Engine as _;
+    use tungstenite::Message;
+
+    // Non-blocking on both ends so one loop can pump audio AND read events.
+    device.set_nonblocking(true)?;
+    match ws.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(s) => s.set_nonblocking(true)?,
+        tungstenite::stream::MaybeTlsStream::NativeTls(s) => s.get_ref().set_nonblocking(true)?,
+        _ => {}
+    }
+
+    let mut buf = [0u8; 2048];
+    let mut seg = String::new(); // text accumulated for the current utterance
+    loop {
+        let mut idle = true;
+
+        // 1. Device mic -> Realtime input buffer.
+        match device.read(&mut buf) {
+            Ok(0) => break, // device closed (button)
+            Ok(n) => {
+                idle = false;
+                let pcm24 = resample(&buf[..n], DEVICE_RATE, TTS_RATE); // 16k -> 24k
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&pcm24);
+                let msg = serde_json::json!({ "type": "input_audio_buffer.append", "audio": b64 });
+                let _ = ws.write(Message::Text(msg.to_string()));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        let _ = ws.flush(); // drain queued writes (WouldBlock just retries next loop)
+
+        // 2. Drain any pending Realtime events.
+        loop {
+            match ws.read() {
+                Ok(Message::Text(t)) => {
+                    idle = false;
+                    handle_realtime_event(&t, &mut seg, debug);
+                }
+                Ok(Message::Close(_)) => return Ok(()),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    log(&format!("[stream] Realtime read error: {e}"));
+                    return Ok(());
+                }
+            }
+        }
+
+        if idle {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let _ = ws.close(None);
+    Ok(())
+}
+
+/// Handle one Realtime JSON event: stream transcription deltas to the terminal
+/// (word-by-word) and end the line + copy to clipboard when an utterance completes.
+fn handle_realtime_event(text: &str, seg: &mut String, debug: bool) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    let kind = v["type"].as_str().unwrap_or("");
+    // Log events in debug — but NOT the per-word deltas (they'd interleave with
+    // and shred the inline transcript text being printed).
+    if debug && !kind.ends_with("transcription.delta") {
+        log(&format!("[rt] {kind}"));
+    }
+    // Match by suffix so we tolerate GA prefix changes to the event names.
+    if kind.ends_with("transcription.delta") {
+        if let Some(d) = v["delta"].as_str() {
+            if has_foreign_script(d) {
+                return; // skip CJK/etc. hallucination fragments (we dictate RU/EN)
+            }
+            print!("{d}");
+            let _ = std::io::stdout().flush();
+            seg.push_str(d);
+        }
+    } else if kind.ends_with("transcription.completed") {
+        // The `completed` transcript is authoritative — print it so a phrase is
+        // NEVER lost even if some live deltas were missed. If the live text we
+        // already showed matches, just end the line; otherwise print the full one.
+        let full = v["transcript"].as_str().unwrap_or("").trim().to_string();
+        if has_foreign_script(&full) {
+            seg.clear();
+            return;
+        }
+        let shown = seg.trim();
+        if !full.is_empty() && shown == full {
+            println!(); // live deltas already showed the whole utterance
+        } else {
+            if !shown.is_empty() {
+                println!(); // close the partial live line
+            }
+            if !full.is_empty() {
+                println!("{full}"); // authoritative full transcript
+            }
+        }
+        let _ = std::io::stdout().flush();
+        if is_meaningful_transcript(&full) {
+            copy_to_clipboard(&full);
+        }
+        seg.clear();
+    } else if kind == "error" {
+        log(&format!("[stream] Realtime error: {}", v["error"]));
+    }
+}
+
 // ───────────────────────── M6: voice coding mode ───────────────────────────
 //
 // While CODING_MODE is on, spoken commands go to a PERSISTENT Claude Code
@@ -616,10 +1293,11 @@ fn is_coding_exit(t: &str) -> bool {
 fn coding_mode_step(
     client: &reqwest::blocking::Client,
     cfg: &Config,
+    persona: &Persona,
     transcript: &str,
 ) -> Result<Option<Response>> {
     let speak = |words: &str| -> Result<Response> {
-        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, words)? })
+        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
     };
 
     if CODING_MODE.load(Ordering::Relaxed) {
@@ -635,7 +1313,7 @@ fn coding_mode_step(
             "[coding] {} (continue={continue_session}) in {}",
             transcript, cfg.code_dir
         ));
-        let reply = run_claude_coding(transcript, &cfg.code_dir, continue_session)?;
+        let reply = run_claude_coding(transcript, &cfg.code_dir, continue_session, persona)?;
         log(&format!("[coding {:?}] {}", t.elapsed(), reply.replace('\n', " ").trim()));
         let say = clean_for_speech(&reply);
         let say = if say.is_empty() { "Done.".to_string() } else { say };
@@ -654,11 +1332,15 @@ fn coding_mode_step(
 
 /// Run one turn of the Claude Code session in `code_dir`. Full tools + skip
 /// permission prompts (required for headless autonomy). Returns the spoken summary.
-fn run_claude_coding(transcript: &str, code_dir: &str, continue_session: bool) -> Result<String> {
+fn run_claude_coding(
+    transcript: &str,
+    code_dir: &str,
+    continue_session: bool,
+    persona: &Persona,
+) -> Result<String> {
+    let intro = persona.coding_intro;
     let prompt = format!(
-        "You are Sophia, a hands-free FEMALE voice coding assistant in this project directory \
-         (always speak about yourself as a woman; in Russian ALWAYS use feminine forms like \
-         'сделала', 'запустила', 'готова', never masculine). \
+        "{intro} \
          CONTEXT YOU MUST RESPECT: the user runs a long session of many spoken commands in a row \
          from across the room (6-10 meters away), listening through a small speaker. They are \
          USUALLY NOT looking at the screen — your SPOKEN reply is their main way of knowing what \
@@ -850,7 +1532,7 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
 
     // Voice command: "set volume N".
     if let Some(v) = parse_volume(&transcript) {
-        let pcm = openai_tts(&client, cfg, &format!("Volume set to {v}."))?;
+        let pcm = openai_tts(&client, cfg, &cfg.tts_voice_sophia, &format!("Volume set to {v}."))?;
         return Ok(Response { control: v, pcm });
     }
 
@@ -863,7 +1545,7 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
             "Speaker mode on."
         };
         log("[control] -> enter speaker mode");
-        let pcm = openai_tts(&client, cfg, say)?;
+        let pcm = openai_tts(&client, cfg, &cfg.tts_voice_sophia, say)?;
         return Ok(Response { control: CTRL_SPEAKER, pcm });
     }
 
@@ -871,7 +1553,7 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
     let reply = clean_for_speech(&chat(&client, cfg, &transcript)?);
     log(&format!("[llm {:?}] \"{}\"", t.elapsed(), reply));
 
-    let pcm = openai_tts(&client, cfg, &reply)?;
+    let pcm = openai_tts(&client, cfg, &cfg.tts_voice_sophia, &reply)?;
     Ok(Response { control: CTRL_NONE, pcm })
 }
 
@@ -881,25 +1563,49 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
 // Claude understands the device's abilities instead of us keyword-matching, so
 // any phrasing/language works. Add a skill = add a line to `skills_prompt`.
 
-fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
+fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response> {
     let client = reqwest::blocking::Client::new();
 
     let t = Instant::now();
     let wav = pcm_to_wav(pcm, DEVICE_RATE);
     let transcript = transcribe(&client, cfg, wav)?.trim().to_string();
     log(&format!("[stt {:?}] \"{}\"", t.elapsed(), transcript));
+
     if transcript.is_empty() {
         return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
     }
 
+    // Streaming transcribe (continuous, no gaps): the device opens a long-lived
+    // connection to :9002 and the server segments it. LOCAL = on-PC Whisper,
+    // EXTERNAL = OpenAI. Checked before the plain (chunked) transcribe enter.
+    if is_local_transcribe(&transcript) {
+        log("[transcribe] enter STREAMING (local) — dictate freely; button exits");
+        let pcm = openai_tts(&client, cfg, &persona.voice, "Local transcribe on. Speak now.")?;
+        return Ok(Response { control: CTRL_STREAM_LOCAL, pcm });
+    }
+    if is_external_transcribe(&transcript) {
+        log("[transcribe] enter STREAMING (external) — dictate freely; button exits");
+        let pcm = openai_tts(&client, cfg, &persona.voice, "External transcribe on. Speak now.")?;
+        return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
+    }
+
+    // Plain "стенограмма/транскрибация" (no локаль/внешн qualifier) now also uses
+    // the STREAMING pipeline (no per-sentence loop, no silence hallucinations),
+    // defaulting to external/OpenAI so it works without a local STT server.
+    if is_transcribe_enter(&transcript) {
+        log("[transcribe] enter STREAMING (default external) — dictate freely; button exits");
+        let pcm = openai_tts(&client, cfg, &persona.voice, "Transcribe mode on. Speak now.")?;
+        return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
+    }
+
     // M6: voice coding mode — if active (or being entered), route to Claude Code.
-    if let Some(resp) = coding_mode_step(&client, cfg, &transcript)? {
+    if let Some(resp) = coding_mode_step(&client, cfg, persona, &transcript)? {
         return Ok(resp);
     }
 
     let cur_vol = *LAST_VOLUME.lock().unwrap();
     let t = Instant::now();
-    let raw = run_claude(&skills_prompt(&transcript, cur_vol))?;
+    let raw = run_claude(&skills_prompt(&transcript, cur_vol, persona))?;
     log(&format!("[llm {:?}] {}", t.elapsed(), raw.replace('\n', " ").trim()));
 
     // Parse the skill decision; fall back to speaking the raw text as an answer.
@@ -913,7 +1619,7 @@ fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
             *LAST_VOLUME.lock().unwrap() = v;
             log(&format!("[skill] volume -> {v}"));
             let words = if say.is_empty() { format!("Volume {v}.") } else { say };
-            let pcm = openai_tts(&client, cfg, &words)?;
+            let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
             Ok(Response { control: v, pcm })
         }
         "speaker" => {
@@ -931,7 +1637,7 @@ fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
                 }
             };
             let words = if say.is_empty() { "Speaker mode on.".to_string() } else { say };
-            let pcm = openai_tts(&client, cfg, &words)?;
+            let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
             Ok(Response { control, pcm })
         }
         _ => {
@@ -939,7 +1645,7 @@ fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
             if say.is_empty() {
                 return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
             }
-            let pcm = openai_tts(&client, cfg, &say)?;
+            let pcm = openai_tts(&client, cfg, &persona.voice, &say)?;
             Ok(Response { control: CTRL_NONE, pcm })
         }
     }
@@ -947,12 +1653,11 @@ fn skills_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
 
 /// The skill catalogue the Claude brain chooses from. Current volume is included
 /// so it can handle relative requests ("louder", "тише").
-fn skills_prompt(transcript: &str, cur_volume: u8) -> String {
+fn skills_prompt(transcript: &str, cur_volume: u8, persona: &Persona) -> String {
     let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
+    let intro = persona.skills_intro;
     format!(
-        "You are Sophia, a warm, friendly FEMALE voice assistant — always speak about yourself as a \
-         woman; in Russian ALWAYS use feminine grammatical forms (e.g. 'сделала', 'готова', 'рада', \
-         never 'сделал'/'готов'). You are the brain of a small voice smart-speaker ('ATOM'). The \
+        "{intro} You are the brain of a small voice smart-speaker ('ATOM'). The \
          user speaks to it; you decide what it should DO. Current local time: {now_local} (use it \
          for time/date questions; never web-search the time). The speaker's current volume is \
          {cur_volume} (0-100).\n\n\
@@ -990,9 +1695,14 @@ fn parse_skill(raw: &str) -> Option<(String, Option<u8>, String)> {
 }
 
 /// OpenAI TTS (24 kHz PCM) resampled to the device's 16 kHz.
-fn openai_tts(client: &reqwest::blocking::Client, cfg: &Config, text: &str) -> Result<Vec<u8>> {
+fn openai_tts(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    voice: &str,
+    text: &str,
+) -> Result<Vec<u8>> {
     let t = Instant::now();
-    let tts_pcm = synthesize(client, cfg, text)?;
+    let tts_pcm = synthesize(client, cfg, voice, text)?;
     let out_pcm = resample(&tts_pcm, TTS_RATE, DEVICE_RATE);
     log(&format!(
         "[tts {:?}] {} bytes @24k -> {} bytes @16k",
@@ -1059,12 +1769,17 @@ fn chat(client: &reqwest::blocking::Client, cfg: &Config, user: &str) -> Result<
         .to_string())
 }
 
-fn synthesize(client: &reqwest::blocking::Client, cfg: &Config, text: &str) -> Result<Vec<u8>> {
+fn synthesize(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    voice: &str,
+    text: &str,
+) -> Result<Vec<u8>> {
     // TTS_SPEED controls pace (OpenAI accepts 0.25–4.0; default 1.0).
     let speed: f32 = cfg.tts_speed.parse().unwrap_or(1.3);
     let body = serde_json::json!({
         "model": cfg.tts_model,
-        "voice": cfg.tts_voice,
+        "voice": voice,
         "input": text,
         "response_format": "pcm",
         "speed": speed

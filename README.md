@@ -3,14 +3,16 @@
 PC-side voice-assistant server for the **M5Stack ATOM VoiceS3R** firmware
 ([VoiceS3R](https://github.com/gravitymir/VoiceS3R)).
 
-The device listens for its on-device wake word **"Sophia"** (or a button press),
-records what you say, and streams 16 kHz mono PCM to this server over raw TCP. The
+The device listens for two on-device wake words — **"Sophia"** and **"Jarvis"**
+(or a button press) — records what you say, and streams a 1-byte persona id
+(which name fired) followed by 16 kHz mono PCM to this server over raw TCP. The
 server turns it into a spoken reply (and/or a device command) and streams the
-audio back, which the device plays on its speaker.
+audio back, which the device plays on its speaker. The persona picks the voice and
+character: **Sophia** = female (`nova`), **Jarvis** = male (`onyx`).
 
 ```
-ATOM VoiceS3R  ──("Sophia" / button)── 16 kHz mono PCM ──TCP─▶  ServerVoiceS3R :9000
-   speaker     ◀──────────────────────  16 kHz mono PCM ──TCP──  STT → brain → TTS
+ATOM VoiceS3R  ──(name / button)── [persona byte] + 16 kHz mono PCM ──TCP─▶  ServerVoiceS3R :9000
+   speaker     ◀──────────────────────────────────  16 kHz mono PCM ──TCP──  STT → brain → TTS
 ```
 
 ## Two programs
@@ -27,9 +29,9 @@ to act as a wireless speaker for the PC.
 
 ## Quick start (recommended: `skills` mode)
 
-1. Build:
+1. Build (see [Building](#building) for the one-time toolchain setup):
    ```powershell
-   cargo build --release
+   .\build.bat
    ```
 2. Put a **`.env`** file next to the exe — `target\release\.env` — so you don't
    pass settings on the command line each run (the server reads it automatically;
@@ -37,7 +39,8 @@ to act as a wireless speaker for the PC.
    ```ini
    MODE=skills
    OPENAI_API_KEY=<your-openai-api-key>
-   TTS_VOICE=nova
+   TTS_VOICE_SOPHIA=nova
+   TTS_VOICE_JARVIS=onyx
    TTS_SPEED=1.4
    CODE_DIR=C:/Users/you/voice-code
    ```
@@ -61,6 +64,13 @@ to act as a wireless speaker for the PC.
 - **speaker** — enter WiFi speaker mode ("режим колонки"); can also set volume
   in the same command.
 - **coding mode** — see below.
+- **transcribe mode** — see below.
+
+**Dual persona.** The device sends a persona id (which wake word fired) as the
+first request byte. Say **"Sophia"** → female persona, `TTS_VOICE_SOPHIA` (`nova`); say
+**"Jarvis"** → male persona, `TTS_VOICE_JARVIS` (`onyx`). The brain and the coding
+agent both adopt the matching character and grammatical gender for that turn. A
+button press uses the default Sophia persona.
 
 Needs `OPENAI_API_KEY` (STT + TTS) and the [`claude` CLI](https://claude.com/claude-code) on `PATH`.
 
@@ -91,6 +101,51 @@ sentence** and only points you to the screen at milestones (e.g. a browser resul
 > project you're comfortable letting voice commands modify (the default is a
 > sandbox folder).
 
+## Transcribe mode (voice → text)
+
+Turns the device into a pure dictation tool. In `skills` mode, say the wake word
+then **"режим транскрибации"** (or "transcribe mode" / "режим стенограммы" /
+"voice to text" / "диктовка"). The device confirms *"Transcribe mode on. Speak
+now."* and then **records sentence after sentence continuously — no wake word
+between them**. Each utterance is transcribed, printed in the server terminal
+(`📝 TRANSCRIPT`) and copied to the **Windows clipboard** — nothing is sent to the
+LLM and nothing is spoken back, so you can paste it into any other app or website.
+
+**Two ways out** (voice does not exit, so dictated text is never mistaken for a
+command):
+1. **Press the device button** (G41) — the device signals the server and you hear
+   *"Transcribe mode off."*
+2. **Idle timeout** — after `TRANSCRIBE_TIMEOUT` seconds (default **60**) with no
+   speech, the server leaves the mode automatically.
+
+After exiting, the device returns to normal **wake-word listening**. Each sentence
+is printed in the terminal and copied to the clipboard (per sentence; no full-
+session accumulation).
+
+Set the timeout in `.env`: `TRANSCRIBE_TIMEOUT=60` (seconds).
+
+### Streaming transcribe (continuous, no gaps)
+
+The mode above re-connects per sentence. For fluid dictation there's a **streaming**
+variant: the device opens one long-lived connection (port **9002**) and pushes the
+mic continuously; the server segments it (server-side VAD) and transcribes each
+segment off the read path, so nothing is lost between sentences. **Exit = button.**
+
+- **"локальная стенограмма"** / "локальная / внутренняя транскрибация" → **local
+  whisper.cpp running INSIDE the server** (via `whisper-rs` — no Python, no extra
+  process). The model auto-downloads once to `models\ggml-<size>.bin` on first use
+  (`WHISPER_MODEL`, default `small`). Fully offline after that, free.
+- **"внешняя транскрибация"** / "стенограмма с внешней обработкой" → **OpenAI
+  Realtime API** (websocket, word-by-word, server-side VAD). Lower latency, more
+  accurate, but uses your OpenAI key.
+
+**Automatic fallback:** if the external (Realtime) websocket can't connect — bad /
+expired / missing key, no access, or no network — the server logs it and falls
+back to the **local** model, so you still get text.
+
+Both detect Russian/English automatically and drop foreign-script hallucinations.
+Exit either with the **button**.
+
 ## WiFi speaker mode
 
 `pc_speaker.exe` (port 9001) loopback-captures the PC's **default output device**
@@ -114,14 +169,21 @@ per line, `#` comments; real environment variables take precedence.
 | `MODE` | `windows` | `skills` \| `windows` \| `openai` \| `loopback` |
 | `OPENAI_API_KEY` | — | Required for `skills` and `openai` (STT + TTS) |
 | `PORT` | `9000` | TCP listen port |
-| `TTS_VOICE` | `alloy` | OpenAI TTS voice (`nova`, `shimmer`, `coral`, …) |
+| `TTS_VOICE_SOPHIA` | `nova` | OpenAI TTS voice for the **Sophia** persona (`nova`, `shimmer`, …) |
+| `TTS_VOICE_JARVIS` | `onyx` | OpenAI TTS voice for the **Jarvis** persona (`onyx`, `echo`, `ash`) |
 | `TTS_SPEED` | `1.3` | Speech rate (0.25–4.0; higher = faster) |
 | `CODE_DIR` | `C:/Users/gravi/voice-code` | Project folder for voice coding mode (M6) |
-| `STT_MODEL` | `whisper-1` | OpenAI transcription model |
+| `TRANSCRIBE_TIMEOUT` | `60` | Seconds of silence before (chunked) transcribe mode auto-exits |
+| `WHISPER_MODEL` | `small` | Local whisper.cpp model: `tiny`\|`base`\|`small`\|`medium`\|`large-v3` (auto-downloaded) |
+| `WHISPER_LANGUAGE` | (auto) | Pin local STT language (`ru`/`en`); empty = auto-detect |
+| `REALTIME_MODEL` | `gpt-4o-transcribe` | OpenAI Realtime transcription model (external streaming) |
+| `REALTIME_SILENCE_MS` | `1500` | Realtime server-VAD silence (ms) before finalizing a phrase |
+| `REALTIME_DEBUG` | unset | If `1`, log every Realtime websocket event |
+| `STT_MODEL` | `whisper-1` | OpenAI transcription model (command recognition) |
 | `CHAT_MODEL` | `gpt-4o-mini` | (openai mode) reply model |
 | `TTS_MODEL` | `gpt-4o-mini-tts` | OpenAI speech model |
 | `STT_ENGINE` | `whisper` | (windows mode) `whisper` \| `sapi` |
-| `STT_URL` | `http://127.0.0.1:9100/stt` | local Whisper microservice endpoint |
+| `STT_URL` | `http://127.0.0.1:9100/stt` | (windows mode) local Whisper microservice endpoint |
 | `SPEAKER_DEVICE` | (default device) | (pc_speaker) output device name substring |
 | `LOOPBACK` | unset | If set, forces loopback mode |
 
@@ -133,8 +195,32 @@ One TCP connection per utterance:
    its write side (EOF) to mark the end of the utterance.
 2. The server replies with a **1-byte control header** then response PCM:
    `0xFF` = no change · `0x00..=100` = set volume · `0xFE` = enter speaker mode ·
-   `128..=228` = set volume *and* enter speaker mode.
+   `0xFD` = continuous transcribe · `0xFC`/`0xFB` = start streaming transcribe
+   (local / external, on port 9002) · `128..=228` = set volume *and* speaker mode.
 3. The device applies the control byte and plays the PCM.
+
+The request's first byte is a header: low 7 bits = persona (wake word), high bit
+`0x80` = "button: leave transcribe mode".
+
+## Building
+
+The local STT engine is **whisper.cpp embedded via `whisper-rs`**, so the build
+compiles C++ and runs bindgen. One-time prerequisites (Windows):
+
+- **Visual Studio 2022 Build Tools** with the C++ workload (provides `cl.exe`).
+- **CMake** — e.g. `pip install --user cmake`.
+
+Then build with the helper, which sets up the MSVC + CMake environment and points
+bindgen's clang at the MSVC/SDK headers:
+
+```powershell
+.\build.bat            # release build of server_voice_s3r
+.\build.bat --bin pc_speaker
+```
+
+(Plain `cargo build` fails on bindgen because it can't find the system headers —
+use `build.bat` / `build.ps1`.) The first run of local transcribe downloads the
+whisper model (~0.5 GB for `small`) to `models\`.
 
 ## Firewall
 
