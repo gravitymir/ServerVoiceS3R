@@ -29,9 +29,9 @@ to act as a wireless speaker for the PC.
 
 ## Quick start (recommended: `skills` mode)
 
-1. Build (see [Building](#building) for the one-time toolchain setup):
+1. Build:
    ```powershell
-   .\build.bat
+   cargo build --release
    ```
 2. Put a **`.env`** file next to the exe — `target\release\.env` — so you don't
    pass settings on the command line each run (the server reads it automatically;
@@ -131,20 +131,15 @@ variant: the device opens one long-lived connection (port **9002**) and pushes t
 mic continuously; the server segments it (server-side VAD) and transcribes each
 segment off the read path, so nothing is lost between sentences. **Exit = button.**
 
-- **"локальная стенограмма"** / "локальная / внутренняя транскрибация" → **local
-  whisper.cpp running INSIDE the server** (via `whisper-rs` — no Python, no extra
-  process). The model auto-downloads once to `models\ggml-<size>.bin` on first use
-  (`WHISPER_MODEL`, default `small`). Fully offline after that, free.
-- **"внешняя транскрибация"** / "стенограмма с внешней обработкой" → **OpenAI
-  Realtime API** (websocket, word-by-word, server-side VAD). Lower latency, more
-  accurate, but uses your OpenAI key.
+Any transcribe/stenogram command ("стенограмма" / "транскрибация" / "voice to
+text" / "диктовка") starts it. STT is the **OpenAI Realtime API** (websocket,
+word-by-word, server-side VAD); if the websocket can't connect (bad/expired/
+missing key or no network) it falls back to per-segment OpenAI Whisper REST.
+Russian/English auto-detect, foreign-script hallucinations dropped. Exit with the
+**button**.
 
-**Automatic fallback:** if the external (Realtime) websocket can't connect — bad /
-expired / missing key, no access, or no network — the server logs it and falls
-back to the **local** model, so you still get text.
-
-Both detect Russian/English automatically and drop foreign-script hallucinations.
-Exit either with the **button**.
+> A fully local, offline STT engine (whisper.cpp in-process) is planned for a
+> later build; for now transcription uses the OpenAI API.
 
 ## WiFi speaker mode
 
@@ -174,9 +169,8 @@ per line, `#` comments; real environment variables take precedence.
 | `TTS_SPEED` | `1.3` | Speech rate (0.25–4.0; higher = faster) |
 | `CODE_DIR` | `C:/Users/gravi/voice-code` | Project folder for voice coding mode (M6) |
 | `TRANSCRIBE_TIMEOUT` | `60` | Seconds of silence before (chunked) transcribe mode auto-exits |
-| `WHISPER_MODEL` | `small` | Local whisper.cpp model: `tiny`\|`base`\|`small`\|`medium`\|`large-v3` (auto-downloaded) |
-| `WHISPER_LANGUAGE` | (auto) | Pin local STT language (`ru`/`en`); empty = auto-detect |
-| `REALTIME_MODEL` | `gpt-4o-transcribe` | OpenAI Realtime transcription model (external streaming) |
+| `REALTIME_MODEL` | `gpt-4o-transcribe` | OpenAI Realtime transcription model (streaming dictation) |
+| `TYPE_INTO_FOCUS` | unset | Live dictation: paste each phrase (Ctrl+V) into the focused field |
 | `REALTIME_SILENCE_MS` | `1500` | Realtime server-VAD silence (ms) before finalizing a phrase |
 | `REALTIME_DEBUG` | unset | If `1`, log every Realtime websocket event |
 | `STT_MODEL` | `whisper-1` | OpenAI transcription model (command recognition) |
@@ -195,8 +189,8 @@ One TCP connection per utterance:
    its write side (EOF) to mark the end of the utterance.
 2. The server replies with a **1-byte control header** then response PCM:
    `0xFF` = no change · `0x00..=100` = set volume · `0xFE` = enter speaker mode ·
-   `0xFD` = continuous transcribe · `0xFC`/`0xFB` = start streaming transcribe
-   (local / external, on port 9002) · `128..=228` = set volume *and* speaker mode.
+   `0xFD` = continuous transcribe · `0xFB` = start streaming transcribe (port 9002)
+   · `128..=228` = set volume *and* speaker mode.
 3. The device applies the control byte and plays the PCM.
 
 The request's first byte is a header: low 7 bits = persona (wake word), high bit
@@ -204,23 +198,14 @@ The request's first byte is a header: low 7 bits = persona (wake word), high bit
 
 ## Building
 
-The local STT engine is **whisper.cpp embedded via `whisper-rs`**, so the build
-compiles C++ and runs bindgen. One-time prerequisites (Windows):
-
-- **Visual Studio 2022 Build Tools** with the C++ workload (provides `cl.exe`).
-- **CMake** — e.g. `pip install --user cmake`.
-
-Then build with the helper, which sets up the MSVC + CMake environment and points
-bindgen's clang at the MSVC/SDK headers:
+Pure Rust — no C/C++ toolchain, no Python:
 
 ```powershell
-.\build.bat            # release build of server_voice_s3r
-.\build.bat --bin pc_speaker
+cargo build --release
 ```
 
-(Plain `cargo build` fails on bindgen because it can't find the system headers —
-use `build.bat` / `build.ps1`.) The first run of local transcribe downloads the
-whisper model (~0.5 GB for `small`) to `models\`.
+(Transcription uses the OpenAI API. An optional offline whisper.cpp engine is
+planned for later; it will add a C++/CMake build step when introduced.)
 
 ## Firewall
 

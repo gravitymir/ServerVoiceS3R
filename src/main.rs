@@ -16,7 +16,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -39,6 +39,11 @@ static CODING_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Whether the current coding-mode session has been started (controls --continue).
 static CODING_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// HACKER mode (entertainment): while true, every utterance is answered with an
+/// absurd, over-the-top FICTIONAL "successful hack" report. Pure comedy — never
+/// real instructions.
+static HACKER_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Continuous transcribe mode: while true, each utterance is transcribed + printed
 /// (no LLM, no spoken reply). Entered by voice, left by the device's button marker
 /// or by TRANSCRIBE_TIMEOUT seconds of no speech.
@@ -46,6 +51,14 @@ static TRANSCRIBE_MODE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Timestamp of the last actual speech in transcribe mode (for the idle timeout).
 static TRANSCRIBE_LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+/// "Live dictation": when true, each transcribed phrase is pasted (Ctrl+V) into
+/// whatever Windows field currently has focus, not just printed/clipboarded.
+static TYPE_INTO_FOCUS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// How pasted phrases are separated: 0 = leading space, 1 = newline (each phrase
+/// on its own line), 2 = none (joined). Voice-configurable. Default = newline
+/// (each phrase on a new line, no spaces added).
+static TRANSCRIBE_SEP: AtomicU8 = AtomicU8::new(1);
 
 /// Device→server header bit (OR'd into the persona byte): "button pressed — leave
 /// transcribe mode". The accompanying utterance is empty.
@@ -65,8 +78,6 @@ const CTRL_STREAM_LOCAL: u8 = 0xFC;
 const CTRL_STREAM_EXTERNAL: u8 = 0xFB;
 /// Port the device streams the mic to for streaming transcription.
 const TRANSCRIBE_STREAM_PORT: u16 = 9002;
-/// Device→server stream header bit: external backend (else local).
-const STREAM_BACKEND_EXTERNAL: u8 = 0x80;
 
 /// What to send back to the device.
 struct Response {
@@ -133,8 +144,6 @@ struct Config {
     transcribe_timeout_secs: u64, // auto-leave transcribe mode after this much silence
     realtime_model: String, // OpenAI Realtime transcription model (external streaming)
     realtime_silence_ms: u64, // server-VAD silence before a segment ends (Realtime)
-    whisper_model: String, // local whisper.cpp model size (tiny/base/small/medium/large-v3)
-    whisper_language: String, // local whisper language hint ("" = auto-detect)
 }
 
 /// Which on-device wake word fired (sent as the first request byte). Selects the
@@ -261,9 +270,12 @@ fn main() -> Result<()> {
         transcribe_timeout_secs: env_or("TRANSCRIBE_TIMEOUT", "60").parse().unwrap_or(60),
         realtime_model: env_or("REALTIME_MODEL", "gpt-4o-transcribe"),
         realtime_silence_ms: env_or("REALTIME_SILENCE_MS", "1500").parse().unwrap_or(1500),
-        whisper_model: env_or("WHISPER_MODEL", "small"),
-        whisper_language: env_or("WHISPER_LANGUAGE", "").trim().to_lowercase(),
     };
+
+    // Live dictation: paste transcripts into the focused field (Ctrl+V).
+    let tf = env_or("TYPE_INTO_FOCUS", "").trim().to_lowercase();
+    let type_focus = !matches!(tf.as_str(), "" | "0" | "false" | "no" | "off");
+    TYPE_INTO_FOCUS.store(type_focus, Ordering::Relaxed);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
@@ -289,6 +301,9 @@ fn main() -> Result<()> {
             ));
             log(&format!("Coding mode (M6) project dir: {}", cfg.code_dir));
             log(&format!("Transcribe mode idle timeout: {}s", cfg.transcribe_timeout_secs));
+            if type_focus {
+                log("Live dictation: ON — transcripts are pasted (Ctrl+V) into the focused field");
+            }
         }
         "loopback" => log("echoing recorded audio back (no AI)"),
         other => log(&format!("WARNING: unknown MODE '{other}'")),
@@ -754,11 +769,81 @@ fn transcribe_topic(t: &str) -> bool {
         || t.contains("голос в текст")
 }
 
-/// Streaming transcribe with LOCAL processing ("локальная стенограмма" etc.).
-fn is_local_transcribe(t: &str) -> bool {
+/// True if the text mentions pasting into the focused field (RU/EN variants).
+fn mentions_field(t: &str) -> bool {
+    t.contains("в поле")
+        || t.contains("в input")
+        || t.contains("в инпут")
+        || t.contains("into field")
+        || t.contains("into input")
+        || t.contains("typing into")
+        || t.contains("live dictation")
+}
+/// Voice toggle for live dictation (paste into the focused field). Check OFF first.
+fn is_type_focus_off(t: &str) -> bool {
     let t = t.to_lowercase();
-    transcribe_topic(&t) && (t.contains("локаль") || t.contains("local")
-        || t.contains("внутренн") || t.contains("internal"))
+    mentions_field(&t)
+        && (t.contains("выключ") || t.contains("отключ") || t.contains("останов")
+            || t.contains("стоп") || t.contains("не ") || t.contains("off")
+            || t.contains("disable") || t.contains("stop"))
+}
+fn is_type_focus_on(t: &str) -> bool {
+    mentions_field(&t.to_lowercase())
+}
+
+/// Voice "transcribe settings": separator between pasted phrases + paste-into-field
+/// toggle. Returns a spoken confirmation Response if a setting was recognized.
+/// Recognizes e.g. "настройки для транскрибации: с новой строки / пробел впереди /
+/// печать в поле". Must run BEFORE the transcribe-enter matchers (which also match
+/// "стенограмма"/"транскрибация").
+fn transcribe_settings_step(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    persona: &Persona,
+    transcript: &str,
+) -> Result<Option<Response>> {
+    let t = transcript.to_lowercase();
+    let speak = |words: &str| -> Result<Option<Response>> {
+        Ok(Some(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? }))
+    };
+
+    // Separator only makes sense as a transcribe/settings instruction — require
+    // that context so we don't grab unrelated speech containing "пробел"/"enter".
+    let ctx = t.contains("настройк") || t.contains("транскри") || t.contains("стеногра")
+        || t.contains("диктов");
+    if ctx {
+        if t.contains("новой строк") || t.contains("новая строк") || t.contains("новой строки")
+            || t.contains("перенос") || t.contains("энтер") || t.contains("enter")
+            || t.contains("new line") || t.contains("newline")
+        {
+            TRANSCRIBE_SEP.store(1, Ordering::Relaxed);
+            log("[type] separator = newline");
+            return speak("Готово, каждая фраза с новой строки.");
+        }
+        if t.contains("пробел") || t.contains("space") {
+            TRANSCRIBE_SEP.store(0, Ordering::Relaxed);
+            log("[type] separator = space");
+            return speak("Готово, фразы через пробел.");
+        }
+        if t.contains("слитно") || t.contains("без пробел") || t.contains("без разделит") {
+            TRANSCRIBE_SEP.store(2, Ordering::Relaxed);
+            log("[type] separator = none");
+            return speak("Готово, без разделителя.");
+        }
+    }
+
+    // Paste-into-field on/off.
+    if is_type_focus_off(transcript) {
+        TYPE_INTO_FOCUS.store(false, Ordering::Relaxed);
+        log("[type] live dictation OFF (voice)");
+        return speak("Печать в поле выключена.");
+    }
+    if is_type_focus_on(transcript) {
+        TYPE_INTO_FOCUS.store(true, Ordering::Relaxed);
+        log("[type] live dictation ON (voice)");
+        return speak("Печать в поле включена.");
+    }
+    Ok(None)
 }
 
 /// Streaming transcribe with EXTERNAL/cloud processing ("внешняя транскрибация").
@@ -834,7 +919,41 @@ fn print_transcript(text: &str) {
     }
     println!("{text}");
     let _ = std::io::stdout().flush();
-    copy_to_clipboard(text);
+    deliver_transcript(text);
+}
+
+/// Put the transcript on the clipboard, and if `TYPE_INTO_FOCUS` is on, paste it
+/// (Ctrl+V) into whatever Windows field has focus — with a trailing space so
+/// consecutive dictated phrases don't run together.
+fn deliver_transcript(text: &str) {
+    if TYPE_INTO_FOCUS.load(Ordering::Relaxed) {
+        // Leading separator so consecutive phrases don't run together (leading,
+        // not trailing — some fields trim trailing whitespace).
+        let prefix = match TRANSCRIBE_SEP.load(Ordering::Relaxed) {
+            1 => "\n", // each phrase on a new line
+            2 => "",   // joined, no separator
+            _ => " ",  // space (default)
+        };
+        if copy_to_clipboard(&format!("{prefix}{text}")) {
+            send_ctrl_v();
+        }
+    } else {
+        copy_to_clipboard(text);
+    }
+}
+
+/// Send Ctrl+V to the foreground window (pastes the clipboard into the focused field).
+fn send_ctrl_v() {
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Filter out empty / punctuation-only segments and Whisper's well-known
@@ -893,29 +1012,19 @@ fn transcribe_stream_handler(mut stream: TcpStream, cfg: std::sync::Arc<Config>)
     if stream.read_exact(&mut head).is_err() {
         return Ok(());
     }
-    let external = head[0] & STREAM_BACKEND_EXTERNAL != 0;
     let persona = Persona::from_byte(head[0] & 0x7F, &cfg);
-    log(&format!(
-        "[stream] transcribe session start (persona {}, {})",
-        persona.name,
-        if external { "external" } else { "local" }
-    ));
-    if external {
-        // True OpenAI Realtime (word-by-word). If the websocket can't be
-        // established — bad/expired/missing API key, no access, network down —
-        // we can't reach OpenAI at all, so fall back to the LOCAL model instead.
-        match realtime_connect(&cfg) {
-            Ok(ws) => stream_realtime_pump(stream, ws, debug_realtime())?,
-            Err(e) => {
-                log("[stream] ⚠ External transcription (OpenAI) unavailable — \
-                     check the API key (missing / wrong / expired) or your network/access.");
-                log(&format!("[stream]   reason: {e:#}"));
-                log("[stream] → falling back to the LOCAL model (needs stt_server.py on STT_URL).");
-                stream_segment_loop(stream, cfg)?;
-            }
+    log(&format!("[stream] transcribe session start (persona {})", persona.name));
+    // OpenAI Realtime (word-by-word). If the websocket can't be established —
+    // bad/expired/missing API key, no access, network down — fall back to
+    // per-segment OpenAI Whisper REST so the session still produces text.
+    match realtime_connect(&cfg) {
+        Ok(ws) => stream_realtime_pump(stream, ws, debug_realtime())?,
+        Err(e) => {
+            log("[stream] ⚠ Realtime unavailable (check OpenAI key / network) — \
+                 falling back to per-segment Whisper.");
+            log(&format!("[stream]   reason: {e:#}"));
+            stream_segment_loop(stream, cfg)?;
         }
-    } else {
-        stream_segment_loop(stream, cfg)?;
     }
     log("[stream] transcribe session ended");
     Ok(())
@@ -933,8 +1042,9 @@ fn stream_segment_loop(mut stream: TcpStream, cfg: std::sync::Arc<Config>) -> Re
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let cfgw = cfg.clone();
     let worker = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
         for seg in rx {
-            let text = whisper_transcribe(&cfgw, &seg).unwrap_or_default();
+            let text = transcribe(&client, &cfgw, pcm_to_wav(&seg, DEVICE_RATE)).unwrap_or_default();
             print_transcript(&text); // prints ONLY the spoken text, one line per segment
         }
     });
@@ -986,118 +1096,6 @@ fn stream_segment_loop(mut stream: TcpStream, cfg: std::sync::Arc<Config>) -> Re
     drop(tx);
     let _ = worker.join();
     Ok(())
-}
-
-/// Local in-process speech-to-text via whisper.cpp (whisper-rs) — NO Python, NO
-/// external process. The model file is downloaded once on first use.
-fn whisper_transcribe(cfg: &Config, pcm: &[u8]) -> Result<String> {
-    let ctx = whisper_ctx(cfg).ok_or_else(|| anyhow!("local whisper model unavailable"))?;
-    let ctx = ctx.lock().unwrap();
-    let mut state = ctx.create_state().map_err(|e| anyhow!("whisper state: {e}"))?;
-
-    // i16 LE @16 kHz -> f32 mono, normalized to -1..1 (what whisper.cpp expects).
-    let mut audio: Vec<f32> = pcm
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-        .collect();
-    // whisper.cpp rejects clips shorter than 1s — pad with trailing silence.
-    if audio.len() < 16_000 {
-        audio.resize(16_000, 0.0);
-    }
-
-    // Language: explicit "auto" when unset, so it detects RU/EN per utterance.
-    // (whisper.cpp's default is English, which would translate Russian to English!)
-    let lang = if cfg.whisper_language.is_empty() {
-        "auto".to_string()
-    } else {
-        cfg.whisper_language.clone()
-    };
-    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_translate(false); // transcribe in the spoken language, do NOT translate
-    params.set_language(Some(&lang));
-    state.full(params, &audio).map_err(|e| anyhow!("whisper full: {e}"))?;
-
-    let n = state.full_n_segments().map_err(|e| anyhow!("whisper segments: {e}"))?;
-    let mut out = String::new();
-    for i in 0..n {
-        if let Ok(seg) = state.full_get_segment_text(i) {
-            out.push_str(&seg);
-        }
-    }
-    Ok(out.trim().to_string())
-}
-
-/// Lazily load the whisper.cpp model (downloading it on first use). Returns the
-/// shared context, or None if it couldn't be obtained/loaded (logged once).
-fn whisper_ctx(cfg: &Config) -> Option<&'static std::sync::Mutex<whisper_rs::WhisperContext>> {
-    static WHISPER: std::sync::OnceLock<Option<std::sync::Mutex<whisper_rs::WhisperContext>>> =
-        std::sync::OnceLock::new();
-    WHISPER
-        .get_or_init(|| {
-            // Route whisper.cpp/ggml's chatty stderr logs into the `log` crate
-            // (no logger installed -> silenced), keeping our transcript clean.
-            whisper_rs::install_logging_hooks();
-            match ensure_whisper_model(cfg) {
-            Ok(path) => {
-                log(&format!("[whisper] loading local model: {}", path.display()));
-                let p = path.to_string_lossy().into_owned();
-                match whisper_rs::WhisperContext::new_with_params(
-                    &p,
-                    whisper_rs::WhisperContextParameters::default(),
-                ) {
-                    Ok(c) => {
-                        log("[whisper] local model ready");
-                        Some(std::sync::Mutex::new(c))
-                    }
-                    Err(e) => {
-                        log(&format!("[whisper] failed to load model: {e}"));
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                log(&format!("[whisper] model unavailable: {e:#}"));
-                None
-            }
-            }
-        })
-        .as_ref()
-}
-
-/// Path to the ggml model next to the exe (models/ggml-<size>.bin), downloading
-/// it from Hugging Face on first use.
-fn ensure_whisper_model(cfg: &Config) -> Result<PathBuf> {
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("models");
-    std::fs::create_dir_all(&dir).ok();
-    let file = format!("ggml-{}.bin", cfg.whisper_model);
-    let path = dir.join(&file);
-    if path.metadata().map(|m| m.len() > 1_000_000).unwrap_or(false) {
-        return Ok(path); // already downloaded
-    }
-    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}");
-    log(&format!("[whisper] downloading local model '{file}' (one-time) — this may take a few minutes…"));
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(1800))
-        .build()?;
-    let mut resp = client.get(&url).send().context("download whisper model")?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("model download HTTP {} ({url})", resp.status()));
-    }
-    let tmp = dir.join(format!("{file}.part"));
-    let mut out = std::fs::File::create(&tmp)?;
-    let n = std::io::copy(&mut resp, &mut out)?;
-    drop(out);
-    std::fs::rename(&tmp, &path)?;
-    log(&format!("[whisper] model downloaded ({:.0} MB) -> {}", n as f64 / 1_000_000.0, path.display()));
-    Ok(path)
 }
 
 type RealtimeWs = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
@@ -1251,12 +1249,82 @@ fn handle_realtime_event(text: &str, seg: &mut String, debug: bool) {
         }
         let _ = std::io::stdout().flush();
         if is_meaningful_transcript(&full) {
-            copy_to_clipboard(&full);
+            deliver_transcript(&full);
         }
         seg.clear();
     } else if kind == "error" {
         log(&format!("[stream] Realtime error: {}", v["error"]));
     }
+}
+
+// ───────────────────────── Hacker mode (for fun) ───────────────────────────
+//
+// Pure entertainment: the user names a "target" and gets back an absurd, made-up
+// "successful hack" report with ridiculous numbers. It is theatrical fiction —
+// the prompt forbids any real technique or instruction.
+
+fn is_hacker_enter(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("режим хакер") || t.contains("режим взлом") || t.contains("hacker mode")
+        || (t.contains("хакер") && t.contains("режим"))
+}
+
+fn is_hacker_exit(t: &str) -> bool {
+    let t = t.to_lowercase();
+    (t.contains("хакер") || t.contains("hacker"))
+        && (t.contains("выйти") || t.contains("выход") || t.contains("стоп")
+            || t.contains("закончи") || t.contains("выключ") || t.contains("exit")
+            || t.contains("stop"))
+}
+
+/// While HACKER_MODE is on, answer each utterance with an absurd fictional hack
+/// report. Returns None to fall through to the normal skills.
+fn hacker_mode_step(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    persona: &Persona,
+    transcript: &str,
+) -> Result<Option<Response>> {
+    let speak = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+    };
+
+    if HACKER_MODE.load(Ordering::Relaxed) {
+        if is_hacker_exit(transcript) {
+            HACKER_MODE.store(false, Ordering::Relaxed);
+            log("[hacker] exit");
+            return Ok(Some(speak("Выхожу из режима хакера.")?));
+        }
+        let t = Instant::now();
+        let report = hacker_report(client, cfg, transcript)?;
+        log(&format!("[hacker {:?}] {}", t.elapsed(), report.replace('\n', " ").trim()));
+        let say = clean_for_speech(&report);
+        let say = if say.is_empty() { "Цель взломана. Все данные у нас.".to_string() } else { say };
+        return Ok(Some(speak(&say)?));
+    }
+
+    if is_hacker_enter(transcript) {
+        HACKER_MODE.store(true, Ordering::Relaxed);
+        log("[hacker] enter");
+        return Ok(Some(speak("Режим хакера активирован. Назови цель — что взламываем?")?));
+    }
+
+    Ok(None)
+}
+
+/// Generate one absurd, fictional "successful hack" report for the named target.
+fn hacker_report(client: &reqwest::blocking::Client, cfg: &Config, situation: &str) -> Result<String> {
+    let system = "Ты — пародийный «киношный хакер» для РАЗВЛЕКАТЕЛЬНОЙ голосовой игрушки. \
+        Пользователь называет цель (устройство, человека, сеть, провайдера) «взломать». \
+        Ответь ОДНОЙ-двумя короткими фразами как УСПЕШНЫЙ доклад о взломе: абсурдно, уверенно, \
+        весело, с выдуманными цифрами и шпионским жаргоном, доведённое до абсурда. Обязательно \
+        упомяни владельца/устройство из запроса. Это ЧИСТЫЙ ВЫМЫСЕЛ И ЮМОР — НИКОГДА не давай \
+        реальных инструкций, команд, инструментов или способов; только фантастический результат. \
+        Отвечай на языке пользователя (русский/английский). Без markdown, списков, ссылок и эмодзи. \
+        Примеры: «Телефон Райана взломан: выгружено 450 фото и 12 тысяч переписок, подсажен вирус \
+        Шпион-9000, доступ к камере за 0.3 секунды.» / «Провайдер захвачен: отключены прокси-шлюзы, \
+        остановлен контрольный сервер, 35% инфраструктуры под нашим контролем.»";
+    openai_chat(client, cfg, system, situation)
 }
 
 // ───────────────────────── M6: voice coding mode ───────────────────────────
@@ -1575,27 +1643,26 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
     }
 
-    // Streaming transcribe (continuous, no gaps): the device opens a long-lived
-    // connection to :9002 and the server segments it. LOCAL = on-PC Whisper,
-    // EXTERNAL = OpenAI. Checked before the plain (chunked) transcribe enter.
-    if is_local_transcribe(&transcript) {
-        log("[transcribe] enter STREAMING (local) — dictate freely; button exits");
-        let pcm = openai_tts(&client, cfg, &persona.voice, "Local transcribe on. Speak now.")?;
-        return Ok(Response { control: CTRL_STREAM_LOCAL, pcm });
+    // Voice "transcribe settings" — separator (space / newline / none) and the
+    // paste-into-field toggle. MUST come before the transcribe-enter matchers,
+    // since "настройки для стенограммы …" also contains "стеногра".
+    if let Some(resp) = transcribe_settings_step(&client, cfg, persona, &transcript)? {
+        return Ok(resp);
     }
-    if is_external_transcribe(&transcript) {
-        log("[transcribe] enter STREAMING (external) — dictate freely; button exits");
-        let pcm = openai_tts(&client, cfg, &persona.voice, "External transcribe on. Speak now.")?;
+
+    // Streaming transcribe (continuous, no gaps): the device opens a long-lived
+    // connection to :9002 which the server pushes to OpenAI Realtime. Any
+    // transcribe/stenogram command (incl. "локальная" — local STT is not built
+    // yet) enters this OpenAI streaming mode.
+    if is_external_transcribe(&transcript) || is_transcribe_enter(&transcript) {
+        log("[transcribe] enter STREAMING (OpenAI Realtime) — dictate freely; button exits");
+        let pcm = openai_tts(&client, cfg, &persona.voice, "Transcribe mode on. Speak now.")?;
         return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
     }
 
-    // Plain "стенограмма/транскрибация" (no локаль/внешн qualifier) now also uses
-    // the STREAMING pipeline (no per-sentence loop, no silence hallucinations),
-    // defaulting to external/OpenAI so it works without a local STT server.
-    if is_transcribe_enter(&transcript) {
-        log("[transcribe] enter STREAMING (default external) — dictate freely; button exits");
-        let pcm = openai_tts(&client, cfg, &persona.voice, "Transcribe mode on. Speak now.")?;
-        return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
+    // Hacker mode (entertainment) — absurd fictional "hack" reports.
+    if let Some(resp) = hacker_mode_step(&client, cfg, persona, &transcript)? {
+        return Ok(resp);
     }
 
     // M6: voice coding mode — if active (or being entered), route to Claude Code.
@@ -1738,16 +1805,30 @@ fn transcribe(client: &reqwest::blocking::Client, cfg: &Config, wav: Vec<u8>) ->
 }
 
 fn chat(client: &reqwest::blocking::Client, cfg: &Config, user: &str) -> Result<String> {
+    openai_chat(
+        client,
+        cfg,
+        "You are a voice assistant on a small smart speaker. Answer in ONE short \
+         spoken sentence (two only if truly necessary). Be direct — give just the key \
+         fact, not background. For weather, give ONLY the current conditions \
+         (temperature and sky) for the asked place, never a multi-day forecast unless \
+         explicitly asked. Never use lists, markdown, URLs, or emojis. Reply in the \
+         user's language (Russian or English).",
+        user,
+    )
+}
+
+/// OpenAI Chat Completions with a custom system prompt.
+fn openai_chat(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    system: &str,
+    user: &str,
+) -> Result<String> {
     let body = serde_json::json!({
         "model": cfg.chat_model,
         "messages": [
-            {"role": "system", "content":
-                "You are a voice assistant on a small smart speaker. Answer in ONE short \
-                 spoken sentence (two only if truly necessary). Be direct — give just the key \
-                 fact, not background. For weather, give ONLY the current conditions \
-                 (temperature and sky) for the asked place, never a multi-day forecast unless \
-                 explicitly asked. Never use lists, markdown, URLs, or emojis. Reply in the \
-                 user's language (Russian or English)."},
+            {"role": "system", "content": system},
             {"role": "user", "content": user}
         ]
     });

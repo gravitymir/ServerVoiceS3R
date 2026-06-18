@@ -14,7 +14,6 @@ chrono = "0.4"
 cpal = "0.15"
 tungstenite = { version = "0.21", features = ["native-tls"] } # OpenAI Realtime websocket
 base64 = "0.22"
-whisper-rs = "0.14" # in-process whisper.cpp for the LOCAL transcribe model (no Python)
 
 [profile.release]
 opt-level = 3
