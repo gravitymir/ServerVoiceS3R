@@ -170,6 +170,8 @@ struct Config {
     realtime_silence_ms: u64, // server-VAD silence before a segment ends (Realtime)
     google_translate_key: String, // Google Cloud Translation API key (translate mode)
     radio_favorites: Vec<RadioStation>, // online-radio favorites
+    compressor_host: String, // StamPLC compressor IP/host (empty = skill disabled)
+    compressor_net: String,  // local-IP prefix that enables the compressor skill (e.g. "192.168.3.")
 }
 
 /// An online-radio favorite: display name, optional pinned stream URL, and extra
@@ -307,6 +309,8 @@ fn main() -> Result<()> {
         realtime_silence_ms: env_or("REALTIME_SILENCE_MS", "1500").parse().unwrap_or(1500),
         google_translate_key: env_or("GOOGLE_TRANSLATE_API_KEY", ""),
         radio_favorites: load_radio_favorites(),
+        compressor_host: env_or("COMPRESSOR_HOST", "").trim().to_string(),
+        compressor_net: env_or("COMPRESSOR_NET", "192.168.3.").trim().to_string(),
     };
 
     // Live dictation: paste transcripts into the focused field (Ctrl+V).
@@ -343,6 +347,12 @@ fn main() -> Result<()> {
             }
             if !cfg.google_translate_key.is_empty() {
                 log("Translate mode: ready (Google Translate)");
+            }
+            if !cfg.compressor_host.is_empty() {
+                log(&format!(
+                    "Compressor skill: {} (only when local IP starts with '{}')",
+                    cfg.compressor_host, cfg.compressor_net
+                ));
             }
         }
         "loopback" => log("echoing recorded audio back (no AI)"),
@@ -1862,6 +1872,11 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         return Ok(resp);
     }
 
+    // Compressor: super-specialized, network-gated skill ("включи/выключи компрессор").
+    if let Some(resp) = compressor_fast_path(&client, cfg, persona, &transcript)? {
+        return Ok(resp);
+    }
+
     // Radio fast path: if the command names a PINNED favorite, play it directly —
     // skipping the (slow, web-searching) brain entirely. The big latency win.
     if let Some((name, url)) = match_favorite_radio(&transcript, cfg) {
@@ -2252,6 +2267,116 @@ fn match_favorite_radio(transcript: &str, cfg: &Config) -> Option<(String, Strin
         Some((_, name, url)) if !tie => Some((name, url)),
         _ => None, // no match, or an ambiguous tie -> let the brain decide
     }
+}
+
+// ───────────────────────── Compressor (StamPLC) ─────────────────────────
+//
+// Super-specialized, network-gated skill: "включи/выключи компрессор" hits a
+// StamPLC HTTP relay (COMPRESSOR_HOST). It only acts when this PC is on the
+// service LAN (its local IP starts with COMPRESSOR_NET) — elsewhere the device
+// just says the compressor isn't reachable here.
+
+fn compressor_fast_path(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    persona: &Persona,
+    transcript: &str,
+) -> Result<Option<Response>> {
+    if cfg.compressor_host.is_empty() {
+        return Ok(None);
+    }
+    let t = transcript.to_lowercase();
+    if !(t.contains("компрессор") || t.contains("compressor")) {
+        return Ok(None);
+    }
+    // off-words first (выключ contains "выкл", never "вкл").
+    let action = if t.contains("выключ") || t.contains("выкл") || t.contains("останов")
+        || t.contains("turn off") || t.contains("switch off") || t.contains("shut")
+    {
+        "off"
+    } else if t.contains("включ") || t.contains("запус") || t.contains("turn on")
+        || t.contains("switch on") || t.contains("start")
+    {
+        "on"
+    } else if t.contains("переключ") || t.contains("toggle") {
+        "toggle"
+    } else if t.contains("состоян") || t.contains("статус") || t.contains("status")
+        || t.contains("работает") || t.contains("проверь")
+    {
+        "status"
+    } else {
+        return Ok(None); // "компрессор" mentioned but no clear action -> let the brain answer
+    };
+
+    let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+    let speak = |words: &str| -> Result<Option<Response>> {
+        Ok(Some(Response {
+            control: CTRL_NONE,
+            pcm: openai_tts(client, cfg, &persona.voice, words)?,
+        }))
+    };
+
+    if !on_compressor_network(cfg) {
+        log("[compressor] off-network — skill not available here");
+        return speak(if ru {
+            "Компрессор доступен только в сети сервиса."
+        } else {
+            "The compressor is only available on the service network."
+        });
+    }
+
+    log(&format!("[compressor] -> /{action} @ {}", cfg.compressor_host));
+    match compressor_request(&cfg.compressor_host, action) {
+        Ok(state) => {
+            let on = state.trim().eq_ignore_ascii_case("ON");
+            let words = if on {
+                if ru { "Компрессор включён." } else { "Compressor is on." }
+            } else if ru {
+                "Компрессор выключен."
+            } else {
+                "Compressor is off."
+            };
+            speak(words)
+        }
+        Err(e) => {
+            log(&format!("[compressor] request failed: {e}"));
+            speak(if ru {
+                "Не удалось связаться с компрессором."
+            } else {
+                "Couldn't reach the compressor."
+            })
+        }
+    }
+}
+
+/// True if this PC's local IP is on the compressor's service network (starts with
+/// COMPRESSOR_NET). Found via the no-traffic UDP "connect" trick.
+fn on_compressor_network(cfg: &Config) -> bool {
+    if cfg.compressor_net.is_empty() {
+        return true; // no gate configured
+    }
+    let local = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect(format!("{}:80", cfg.compressor_host))?;
+            s.local_addr()
+        })
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default();
+    local.starts_with(&cfg.compressor_net)
+}
+
+/// One GET to the StamPLC (`/on` `/off` `/toggle` `/status`); returns the body
+/// ("ON"/"OFF"). 4 s timeout — `/on`/`/off` physically move a servo (~2 s).
+fn compressor_request(host: &str, action: &str) -> Result<String> {
+    let url = format!("http://{host}/{action}");
+    let body = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()?
+        .get(&url)
+        .send()
+        .with_context(|| format!("GET {url}"))?
+        .text()?;
+    Ok(body.trim().to_string())
 }
 
 /// Look up a station by name in Radio Browser; return its resolved stream URL.

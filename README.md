@@ -183,6 +183,16 @@ jargon, pure comedy, never any real technique or instruction. Replies match your
 language. It keeps listening; leave with **"выйти из хакера" / "exit hacker"** or
 the button.
 
+## Compressor (StamPLC, network-gated)
+
+A super-specialized skill for one site: say **"включи компрессор" / "выключи
+компрессор"** (or "состояние компрессора") and the server hits a StamPLC HTTP
+relay — `http://COMPRESSOR_HOST/on` · `/off` · `/toggle` · `/status` — and speaks
+the result. It **only acts when this PC is on the service LAN**: its local IP must
+start with `COMPRESSOR_NET` (default `192.168.3.`); anywhere else it just says the
+compressor isn't reachable here. Enable it by setting `COMPRESSOR_HOST` in `.env`
+(empty = off).
+
 ## Speaker mode & online radio (port 9001)
 
 When the device enters **speaker mode** it connects to port 9001 and plays
