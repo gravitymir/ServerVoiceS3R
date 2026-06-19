@@ -12,12 +12,13 @@
 //!
 //! Other env: PORT (9000), CHAT_MODEL, TTS_MODEL, TTS_VOICE_SOPHIA, TTS_VOICE_JARVIS, STT_MODEL.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -44,6 +45,13 @@ static CODING_STARTED: std::sync::atomic::AtomicBool =
 /// real instructions.
 static HACKER_MODE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Translate mode: while true, each utterance is translated (Google Translate) to
+/// TRANSLATE_TARGET and spoken back. Entered by voice (brain picks the target),
+/// left by a voice exit phrase.
+static TRANSLATE_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Target language (ISO-639-1, e.g. "en", "es") for translate mode.
+static TRANSLATE_TARGET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// Continuous transcribe mode: while true, each utterance is transcribed + printed
 /// (no LLM, no spoken reply). Entered by voice, left by the device's button marker
 /// or by TRANSCRIBE_TIMEOUT seconds of no speech.
@@ -78,6 +86,22 @@ const CTRL_STREAM_LOCAL: u8 = 0xFC;
 const CTRL_STREAM_EXTERNAL: u8 = 0xFB;
 /// Port the device streams the mic to for streaming transcription.
 const TRANSCRIBE_STREAM_PORT: u16 = 9002;
+
+/// Online radio. Reuses SPEAKER MODE: the `radio` skill starts an ffmpeg that
+/// decodes a live stream to 16 kHz mono PCM, replies with CTRL_SPEAKER, and the
+/// device connects to this port (same as `pc_speaker`) and plays it until the
+/// button is pressed (button also exits + listens for the next command, so you
+/// switch stations by: press button -> say the next station). Don't run
+/// `pc_speaker.exe` at the same time — both want this port.
+const RADIO_STREAM_PORT: u16 = 9001;
+/// The running ffmpeg decoder for the current station (killed on stop/switch).
+static RADIO_CHILD: std::sync::Mutex<Option<Child>> = std::sync::Mutex::new(None);
+/// Its stdout (raw 16 kHz mono PCM), handed to the radio-stream connection handler.
+static RADIO_STDOUT: std::sync::Mutex<Option<ChildStdout>> = std::sync::Mutex::new(None);
+/// PC-audio (WASAPI loopback) captured as 16 kHz mono s16le — the folded-in
+/// `pc_speaker`. Speaker mode mirrors this when no radio station is active, so
+/// one process/port serves both. Bounded in the capture callback (~0.5 s).
+static LOOPBACK_BUF: std::sync::Mutex<VecDeque<u8>> = std::sync::Mutex::new(VecDeque::new());
 
 /// What to send back to the device.
 struct Response {
@@ -144,6 +168,17 @@ struct Config {
     transcribe_timeout_secs: u64, // auto-leave transcribe mode after this much silence
     realtime_model: String, // OpenAI Realtime transcription model (external streaming)
     realtime_silence_ms: u64, // server-VAD silence before a segment ends (Realtime)
+    google_translate_key: String, // Google Cloud Translation API key (translate mode)
+    radio_favorites: Vec<RadioStation>, // online-radio favorites
+}
+
+/// An online-radio favorite: display name, optional pinned stream URL, and extra
+/// spoken aliases (e.g. Latin spellings so an English request matches a
+/// Cyrillic-named station: "Кис ФМ" ← "kiss").
+struct RadioStation {
+    name: String,
+    url: Option<String>,
+    aliases: Vec<String>,
 }
 
 /// Which on-device wake word fired (sent as the first request byte). Selects the
@@ -270,6 +305,8 @@ fn main() -> Result<()> {
         transcribe_timeout_secs: env_or("TRANSCRIBE_TIMEOUT", "60").parse().unwrap_or(60),
         realtime_model: env_or("REALTIME_MODEL", "gpt-4o-transcribe"),
         realtime_silence_ms: env_or("REALTIME_SILENCE_MS", "1500").parse().unwrap_or(1500),
+        google_translate_key: env_or("GOOGLE_TRANSLATE_API_KEY", ""),
+        radio_favorites: load_radio_favorites(),
     };
 
     // Live dictation: paste transcripts into the focused field (Ctrl+V).
@@ -304,6 +341,9 @@ fn main() -> Result<()> {
             if type_focus {
                 log("Live dictation: ON — transcripts are pasted (Ctrl+V) into the focused field");
             }
+            if !cfg.google_translate_key.is_empty() {
+                log("Translate mode: ready (Google Translate)");
+            }
         }
         "loopback" => log("echoing recorded audio back (no AI)"),
         other => log(&format!("WARNING: unknown MODE '{other}'")),
@@ -333,6 +373,34 @@ fn main() -> Result<()> {
             Err(e) => log(&format!("[stream] bind {addr2} failed: {e}")),
         });
     }
+
+    // Online-radio stream listener (port 9001, same as pc_speaker): when the
+    // `radio` skill fires, the device enters speaker mode and connects here; we
+    // pump the current station's ffmpeg PCM until it disconnects (button press).
+    if cfg.mode == "skills" || cfg.mode == "openai" {
+        if !cfg.radio_favorites.is_empty() {
+            let names: Vec<&str> = cfg.radio_favorites.iter().map(|s| s.name.as_str()).collect();
+            log(&format!("Online radio: {} favorite(s): {}", names.len(), names.join(", ")));
+        }
+        let addr3 = format!("0.0.0.0:{}", RADIO_STREAM_PORT);
+        std::thread::spawn(move || match TcpListener::bind(&addr3) {
+            Ok(l) => {
+                log(&format!("speaker/radio stream listening on {addr3}"));
+                for s in l.incoming().flatten() {
+                    std::thread::spawn(move || speaker_stream_handler(s));
+                }
+            }
+            Err(e) => log(&format!("[speaker] bind {addr3} failed (another speaker server running?): {e}")),
+        });
+    }
+
+    // PC-audio loopback capture (folded-in pc_speaker), kept alive for the whole
+    // run. Speaker mode mirrors it whenever no radio station is playing.
+    let _loopback = if cfg.mode == "skills" || cfg.mode == "openai" {
+        start_loopback_capture()
+    } else {
+        None
+    };
 
     for stream in listener.incoming() {
         match stream {
@@ -370,10 +438,14 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
     let mut pcm = Vec::new();
     stream.read_to_end(&mut pcm).context("reading utterance PCM")?;
 
-    // Button exit from transcribe mode: clear state, confirm, done.
+    // Button exit from a "keep-listening" mode (transcribe / translate / hacker):
+    // clear all of them and return to wake-word listening.
     if exit_transcribe {
         TRANSCRIBE_MODE.store(false, Ordering::Relaxed);
-        log("[transcribe] exit (button) — back to wake-word listening");
+        TRANSLATE_MODE.store(false, Ordering::Relaxed);
+        HACKER_MODE.store(false, Ordering::Relaxed);
+        CODING_MODE.store(false, Ordering::Relaxed);
+        log("[exit] button — back to wake-word listening");
         let pcm = transcribe_off_pcm(cfg, &persona);
         stream.write_all(&[CTRL_NONE]).ok();
         if !pcm.is_empty() {
@@ -1288,25 +1360,39 @@ fn hacker_mode_step(
     let speak = |words: &str| -> Result<Response> {
         Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
     };
+    // Like `speak`, but 0xFD => the device listens again immediately (no wake word).
+    let speak_keep = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_TRANSCRIBE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+    };
+    // Reply in the language of the request (Cyrillic => Russian, else English).
+    let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
 
     if HACKER_MODE.load(Ordering::Relaxed) {
         if is_hacker_exit(transcript) {
             HACKER_MODE.store(false, Ordering::Relaxed);
             log("[hacker] exit");
-            return Ok(Some(speak("Выхожу из режима хакера.")?));
+            return Ok(Some(speak(if ru { "Выхожу из режима хакера." } else { "Exiting hacker mode." })?));
         }
         let t = Instant::now();
         let report = hacker_report(client, cfg, transcript)?;
         log(&format!("[hacker {:?}] {}", t.elapsed(), report.replace('\n', " ").trim()));
         let say = clean_for_speech(&report);
-        let say = if say.is_empty() { "Цель взломана. Все данные у нас.".to_string() } else { say };
-        return Ok(Some(speak(&say)?));
+        let say = if say.is_empty() {
+            (if ru { "Цель взломана. Все данные у нас." } else { "Target hacked. All their data is ours." }).to_string()
+        } else {
+            say
+        };
+        return Ok(Some(speak_keep(&say)?));
     }
 
     if is_hacker_enter(transcript) {
         HACKER_MODE.store(true, Ordering::Relaxed);
         log("[hacker] enter");
-        return Ok(Some(speak("Режим хакера активирован. Назови цель — что взламываем?")?));
+        return Ok(Some(speak_keep(if ru {
+            "Режим хакера активирован. Назови цель — что взламываем?"
+        } else {
+            "Hacker mode activated. Name your target — what are we hacking?"
+        })?));
     }
 
     Ok(None)
@@ -1314,17 +1400,104 @@ fn hacker_mode_step(
 
 /// Generate one absurd, fictional "successful hack" report for the named target.
 fn hacker_report(client: &reqwest::blocking::Client, cfg: &Config, situation: &str) -> Result<String> {
-    let system = "Ты — пародийный «киношный хакер» для РАЗВЛЕКАТЕЛЬНОЙ голосовой игрушки. \
-        Пользователь называет цель (устройство, человека, сеть, провайдера) «взломать». \
-        Ответь ОДНОЙ-двумя короткими фразами как УСПЕШНЫЙ доклад о взломе: абсурдно, уверенно, \
-        весело, с выдуманными цифрами и шпионским жаргоном, доведённое до абсурда. Обязательно \
-        упомяни владельца/устройство из запроса. Это ЧИСТЫЙ ВЫМЫСЕЛ И ЮМОР — НИКОГДА не давай \
-        реальных инструкций, команд, инструментов или способов; только фантастический результат. \
-        Отвечай на языке пользователя (русский/английский). Без markdown, списков, ссылок и эмодзи. \
-        Примеры: «Телефон Райана взломан: выгружено 450 фото и 12 тысяч переписок, подсажен вирус \
-        Шпион-9000, доступ к камере за 0.3 секунды.» / «Провайдер захвачен: отключены прокси-шлюзы, \
-        остановлен контрольный сервер, 35% инфраструктуры под нашим контролем.»";
-    openai_chat(client, cfg, system, situation)
+    let ru = situation.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+    let lang = if ru { "Russian" } else { "English" };
+    let system = format!(
+        "You are a parody 'movie hacker' for an ENTERTAINMENT voice toy. The user names a target \
+         (a device, person, network, ISP) to 'hack'. Reply with ONE or two short sentences as a \
+         SUCCESSFUL hack report: absurd, confident, fun, with made-up numbers and over-the-top spy \
+         jargon taken to the point of comedy. Always mention the owner/device from the request. This \
+         is PURE FICTION AND COMEDY — NEVER give real instructions, commands, tools, or methods; only \
+         a fantastical made-up result. CRITICAL: reply ONLY in {lang} — match the language of the \
+         user's request. No markdown, lists, links, or emojis.\n\
+         Example (English): \"Ryan's phone is owned — 450 photos and 12,000 messages exfiltrated, the \
+         Spy-9000 worm deployed, camera access in 0.3 seconds.\"\n\
+         Example (Russian): «Провайдер захвачен: отключены прокси-шлюзы, остановлен контрольный \
+         сервер, 35% инфраструктуры под нашим контролем.»"
+    );
+    openai_chat(client, cfg, &system, situation)
+}
+
+// ───────────────────────── Translate mode ─────────────────────────
+//
+// While TRANSLATE_MODE is on, each utterance is translated (Google Cloud
+// Translation v2) to TRANSLATE_TARGET and spoken back — no LLM in the loop.
+
+/// True if the utterance asks to leave translate mode (RU/EN). Requires the word
+/// "перевод"/"translat" so ordinary content isn't mistaken for an exit.
+fn is_translate_exit(t: &str) -> bool {
+    let t = t.to_lowercase();
+    let ru = t.contains("перевод")
+        && (t.contains("выйти") || t.contains("выход") || t.contains("выключ")
+            || t.contains("закончи") || t.contains("останови") || t.contains("стоп")
+            || t.contains("хватит"));
+    let en = t.contains("translat")
+        && (t.contains("exit") || t.contains("stop") || t.contains("off")
+            || t.contains("quit") || t.contains("end") || t.contains("turn off"));
+    ru || en || t.contains("хватит переводить")
+}
+
+/// While translate mode is on, translate the utterance and speak it. Returns None
+/// to fall through to the normal skills.
+fn translate_mode_step(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    persona: &Persona,
+    transcript: &str,
+) -> Result<Option<Response>> {
+    if !TRANSLATE_MODE.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+    if is_translate_exit(transcript) {
+        TRANSLATE_MODE.store(false, Ordering::Relaxed);
+        log("[translate] exit");
+        let say = if ru { "Выхожу из режима перевода." } else { "Exiting translate mode." };
+        return Ok(Some(Response {
+            control: CTRL_NONE,
+            pcm: openai_tts(client, cfg, &persona.voice, say)?,
+        }));
+    }
+    if transcript.trim().is_empty() {
+        // Silence/pause — stay in the mode and keep listening (0xFD).
+        return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
+    }
+    let target = TRANSLATE_TARGET.lock().unwrap().clone();
+    let t = Instant::now();
+    let translated = google_translate(client, cfg, transcript, &target)?;
+    log(&format!("[translate -> {target} {:?}] {translated}", t.elapsed()));
+    let say = if translated.trim().is_empty() { transcript.to_string() } else { translated };
+    // 0xFD => after speaking the translation, listen again immediately.
+    Ok(Some(Response {
+        control: CTRL_TRANSCRIBE,
+        pcm: openai_tts(client, cfg, &persona.voice, &say)?,
+    }))
+}
+
+/// Translate `text` to `target` (ISO-639-1) via Google Cloud Translation API v2.
+/// Source language is auto-detected.
+fn google_translate(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    text: &str,
+    target: &str,
+) -> Result<String> {
+    let resp = client
+        .post("https://translation.googleapis.com/language/translate/v2")
+        .query(&[("key", cfg.google_translate_key.as_str())])
+        .form(&[("q", text), ("target", target), ("format", "text")])
+        .send()
+        .context("google translate request")?;
+    let status = resp.status();
+    let body = resp.text()?;
+    if !status.is_success() {
+        return Err(anyhow!("google translate {status}: {body}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    Ok(v["data"]["translations"][0]["translatedText"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }
 
 // ───────────────────────── M6: voice coding mode ───────────────────────────
@@ -1367,6 +1540,10 @@ fn coding_mode_step(
     let speak = |words: &str| -> Result<Response> {
         Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
     };
+    // Like `speak`, but 0xFD => the device listens again immediately (no wake word).
+    let speak_keep = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_TRANSCRIBE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+    };
 
     if CODING_MODE.load(Ordering::Relaxed) {
         if is_coding_exit(transcript) {
@@ -1385,14 +1562,14 @@ fn coding_mode_step(
         log(&format!("[coding {:?}] {}", t.elapsed(), reply.replace('\n', " ").trim()));
         let say = clean_for_speech(&reply);
         let say = if say.is_empty() { "Done.".to_string() } else { say };
-        return Ok(Some(speak(&say)?));
+        return Ok(Some(speak_keep(&say)?));
     }
 
     if is_coding_enter(transcript) {
         CODING_MODE.store(true, Ordering::Relaxed);
         CODING_STARTED.store(false, Ordering::Relaxed); // next command starts a fresh session
         log(&format!("[coding] enter ({})", cfg.code_dir));
-        return Ok(Some(speak("Coding mode on. What should I build?")?));
+        return Ok(Some(speak_keep("Coding mode on. What should I build?")?));
     }
 
     Ok(None)
@@ -1660,6 +1837,11 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
     }
 
+    // Translate mode — while active, translate each utterance and speak it back.
+    if let Some(resp) = translate_mode_step(&client, cfg, persona, &transcript)? {
+        return Ok(resp);
+    }
+
     // Hacker mode (entertainment) — absurd fictional "hack" reports.
     if let Some(resp) = hacker_mode_step(&client, cfg, persona, &transcript)? {
         return Ok(resp);
@@ -1670,9 +1852,29 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         return Ok(resp);
     }
 
+    // Radio fast path: if the command names a PINNED favorite, play it directly —
+    // skipping the (slow, web-searching) brain entirely. The big latency win.
+    if let Some((name, url)) = match_favorite_radio(&transcript, cfg) {
+        if probe_stream(&url) {
+            log(&format!("[skill] radio (fast path) -> \"{name}\" @ {url}"));
+            start_radio(&url);
+            let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+            let say = if ru { format!("Включаю {name}.") } else { format!("Playing {name}.") };
+            let pcm = openai_tts(&client, cfg, &persona.voice, &say)?;
+            return Ok(Response { control: CTRL_SPEAKER, pcm });
+        }
+        log(&format!("[skill] radio fast-path '{name}' not live — falling back to brain"));
+    }
+
     let cur_vol = *LAST_VOLUME.lock().unwrap();
+    let favs = cfg
+        .radio_favorites
+        .iter()
+        .map(|s| s.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
     let t = Instant::now();
-    let raw = run_claude(&skills_prompt(&transcript, cur_vol, persona))?;
+    let raw = run_claude(&skills_prompt(&transcript, cur_vol, persona, &favs))?;
     log(&format!("[llm {:?}] {}", t.elapsed(), raw.replace('\n', " ").trim()));
 
     // Parse the skill decision; fall back to speaking the raw text as an answer.
@@ -1707,6 +1909,83 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
             let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
             Ok(Response { control, pcm })
         }
+        "radio" => {
+            let query = json_str(&raw, "query");
+            let url = json_str(&raw, "url");
+            // No specific station ("онлайн-радио" / "список") -> read favorites aloud.
+            if url.trim().is_empty() && (query.trim().is_empty() || is_list_request(&query)) {
+                let names: Vec<String> =
+                    cfg.radio_favorites.iter().map(|s| s.name.clone()).collect();
+                let words = if !say.is_empty() {
+                    say
+                } else if names.is_empty() {
+                    "Список станций пуст. Назови станцию, и я её найду.".to_string()
+                } else {
+                    format!("Доступны: {}. Назови станцию.", names.join(", "))
+                };
+                log("[skill] radio -> list favorites");
+                let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
+                return Ok(Response { control: CTRL_NONE, pcm });
+            }
+            // Resolve a stream URL: brain-provided -> pinned favorite -> Radio Browser.
+            match resolve_station(&query, &url, cfg) {
+                Some(stream_url) => {
+                    log(&format!("[skill] radio -> play \"{query}\" @ {stream_url}"));
+                    if start_radio(&stream_url) {
+                        let words =
+                            if say.is_empty() { format!("Включаю {query}.") } else { say };
+                        let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
+                        Ok(Response { control: CTRL_SPEAKER, pcm })
+                    } else {
+                        let pcm = openai_tts(
+                            &client,
+                            cfg,
+                            &persona.voice,
+                            "Не удалось запустить радио.",
+                        )?;
+                        Ok(Response { control: CTRL_NONE, pcm })
+                    }
+                }
+                None => {
+                    // No LIVE candidate — don't speak the brain's optimistic "включаю",
+                    // and don't enter speaker mode (that would just be silence).
+                    log(&format!("[skill] radio -> no live stream for \"{query}\""));
+                    let pcm = openai_tts(
+                        &client,
+                        cfg,
+                        &persona.voice,
+                        "Не нашла рабочую станцию, попробуй другую.",
+                    )?;
+                    Ok(Response { control: CTRL_NONE, pcm })
+                }
+            }
+        }
+        "translate" => {
+            let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+            if cfg.google_translate_key.is_empty() {
+                log("[skill] translate -> GOOGLE_TRANSLATE_API_KEY not set");
+                let msg = if ru { "Ключ переводчика не задан." } else { "Translation key is not set." };
+                let pcm = openai_tts(&client, cfg, &persona.voice, msg)?;
+                return Ok(Response { control: CTRL_NONE, pcm });
+            }
+            let target = {
+                let t = json_str(&raw, "target").trim().to_lowercase();
+                if t.is_empty() { "en".to_string() } else { t }
+            };
+            TRANSLATE_MODE.store(true, Ordering::Relaxed);
+            *TRANSLATE_TARGET.lock().unwrap() = target.clone();
+            log(&format!("[translate] enter -> target {target}"));
+            let words = if !say.is_empty() {
+                say
+            } else if ru {
+                format!("Режим перевода включён, перевожу на «{target}».")
+            } else {
+                format!("Translate mode on, translating to {target}.")
+            };
+            let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
+            // 0xFD => device plays this, then listens again immediately (no wake word).
+            Ok(Response { control: CTRL_TRANSCRIBE, pcm })
+        }
         _ => {
             log("[skill] -> answer");
             if say.is_empty() {
@@ -1720,7 +1999,7 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
 
 /// The skill catalogue the Claude brain chooses from. Current volume is included
 /// so it can handle relative requests ("louder", "тише").
-fn skills_prompt(transcript: &str, cur_volume: u8, persona: &Persona) -> String {
+fn skills_prompt(transcript: &str, cur_volume: u8, persona: &Persona, favorites: &str) -> String {
     let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
     let intro = persona.skills_intro;
     format!(
@@ -1738,7 +2017,19 @@ fn skills_prompt(transcript: &str, cur_volume: u8, persona: &Persona) -> String 
          \"громкость 70 и включи режим колонки\"):\n\
          {{\"skill\":\"speaker\",\"level\":<optional 0-100>,\"say\":\"<short confirmation>\"}}\n\
          3) Answer a question or chat (you MAY use web search for live facts like weather/news):\n\
-         {{\"skill\":\"answer\",\"say\":\"<the spoken answer>\"}}\n\n\
+         {{\"skill\":\"answer\",\"say\":\"<the spoken answer>\"}}\n\
+         4) Play ONLINE RADIO. The user wants a station (\"включи онлайн-радио\", \"включи Ретро ФМ\", \
+         \"включи радио\", \"online radio\"). Favorite stations: [{favorites}]. Find a DIRECT audio \
+         stream URL for the requested station (you MAY web-search; it MUST be a raw audio stream — \
+         .mp3/.aac/Icecast/Shoutcast/.m3u8 — NOT a webpage and NOT YouTube). If the user did NOT name \
+         a station (just \"онлайн-радио\" / asks what's available / \"список\"), set query to \"list\" \
+         and leave url empty so the device reads the favorites aloud:\n\
+         {{\"skill\":\"radio\",\"query\":\"<station/genre, or 'list'>\",\"url\":\"<direct stream URL, or empty>\",\"say\":\"<short confirmation>\"}}\n\
+         5) Enter TRANSLATE mode — the user wants spoken translation (\"режим перевода\", \
+         \"переводи на английский\", \"translate to Spanish\", \"translate mode\"). Set 'target' to the \
+         destination language as an ISO-639-1 code (en, ru, es, de, fr, it, uk, pl, pt, zh, ja, ar, …); \
+         if no language is named, use \"en\":\n\
+         {{\"skill\":\"translate\",\"target\":\"<iso code>\",\"say\":\"<short confirmation in the user's language, e.g. 'Режим перевода включён, перевожу на английский'>\"}}\n\n\
          Rules for 'say': ONE short sentence, in the SAME language the user used (Russian or English); \
          for weather give only the current conditions, never a multi-day forecast unless asked; never \
          include URLs, citations, markdown, lists, or emojis. Output ONLY the JSON object.\n\n\
@@ -1759,6 +2050,389 @@ fn parse_skill(raw: &str) -> Option<(String, Option<u8>, String)> {
     let level = v["level"].as_u64().map(|n| n.min(100) as u8);
     let say = v["say"].as_str().unwrap_or("").to_string();
     Some((skill, level, say))
+}
+
+// ─────────────────────────── Online radio ───────────────────────────
+//
+// Reuses SPEAKER MODE: the `radio` skill resolves a live stream URL, starts an
+// ffmpeg decoder (-> 16 kHz mono PCM), replies CTRL_SPEAKER, and the device
+// connects to RADIO_STREAM_PORT and plays until the button is pressed.
+
+/// Extract a string field from the brain's JSON reply (tolerant of extra text).
+fn json_str(raw: &str, key: &str) -> String {
+    let parse = || -> Option<String> {
+        let s = raw.find('{')?;
+        let e = raw.rfind('}')?;
+        if e <= s {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(&raw[s..=e]).ok()?;
+        Some(v[key].as_str()?.to_string())
+    };
+    parse().unwrap_or_default()
+}
+
+/// True if the radio query is a "list / what's available" request, not a station.
+fn is_list_request(q: &str) -> bool {
+    let q = q.to_lowercase();
+    ["list", "список", "станци", "какие", "available", "что есть"]
+        .iter()
+        .any(|w| q.contains(w))
+}
+
+/// Read favorites from env: RADIO_FAV_1..N, each
+/// "Name", "Name | https://stream", or "Name | https://stream | alias1, alias2".
+fn load_radio_favorites() -> Vec<RadioStation> {
+    let mut out = Vec::new();
+    for i in 1..=20 {
+        let raw = env_or(&format!("RADIO_FAV_{i}"), "");
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let mut parts = raw.split('|');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let url = parts
+            .next()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+        let aliases = parts
+            .next()
+            .map(|a| {
+                a.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !name.is_empty() {
+            out.push(RadioStation { name, url, aliases });
+        }
+    }
+    out
+}
+
+/// Pick a *live* stream URL. Builds candidates in priority order — 1) the URL the
+/// brain found, 2) a pinned favorite, 3) the free Radio Browser directory — then
+/// returns the first one that actually decodes (so a dead/404 URL is skipped
+/// instead of dumping the device into silent speaker mode).
+fn resolve_station(query: &str, brain_url: &str, cfg: &Config) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let bu = brain_url.trim();
+    if bu.starts_with("http") {
+        candidates.push(bu.to_string());
+    }
+    let q = query.trim().to_lowercase();
+    if !q.is_empty() {
+        for s in &cfg.radio_favorites {
+            if let Some(url) = &s.url {
+                let n = s.name.to_lowercase();
+                let alias_hit = s.aliases.iter().any(|a| {
+                    let a = a.to_lowercase();
+                    !a.is_empty() && (q.contains(&a) || a.contains(&q))
+                });
+                if n.contains(&q) || q.contains(&n) || alias_hit {
+                    candidates.push(url.clone());
+                }
+            }
+        }
+        if let Some(u) = radio_browser_search(query) {
+            candidates.push(u);
+        }
+    }
+    candidates.dedup();
+    for url in candidates {
+        if probe_stream(&url) {
+            return Some(url);
+        }
+        log(&format!("[radio] not live, skipping: {url}"));
+    }
+    None
+}
+
+/// "Check live": run ffmpeg to decode ~1 s of the stream. Success means it's
+/// reachable and decodable; a dead/404/hanging URL fails or times out (~6 s cap).
+fn probe_stream(url: &str) -> bool {
+    let ffmpeg = env_or("FFMPEG", "ffmpeg");
+    let mut child = match Command::new(&ffmpeg)
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-i", url,
+            "-t", "1", "-f", "null", "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for _ in 0..120 {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false // timed out -> treat as not live
+}
+
+/// Lowercase + normalize ё/фм so Cyrillic/Latin station spellings match.
+fn normalize_radio(s: &str) -> String {
+    s.to_lowercase().replace('ё', "е").replace("фм", "fm")
+}
+
+/// Distinctive words of a station name — drops generic "fm"/"radio"/… and a
+/// trailing "fm" stuck to a token ("96fm" -> "96", "redfm" -> "red").
+fn radio_core_words(name: &str) -> Vec<String> {
+    const GENERIC: &[&str] = &["fm", "radio", "радио", "online", "онлайн", "the", "ua"];
+    normalize_radio(name)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.strip_suffix("fm").unwrap_or(w).to_string())
+        .filter(|w| !w.is_empty() && !GENERIC.contains(&w.as_str()))
+        .collect()
+}
+
+/// If the command clearly names a PINNED favorite, return (name, url) so it can be
+/// played WITHOUT calling the brain. Requires a radio/play context word and an
+/// unambiguous best match (a tie bails out to the brain).
+fn match_favorite_radio(transcript: &str, cfg: &Config) -> Option<(String, String)> {
+    let t = normalize_radio(transcript);
+    const CONTEXT: &[&str] = &[
+        "радио", "radio", "fm", "станц", "station", "включ", "поставь", "переключ",
+        "вруб", "запусти", "play", "switch", "turn on", "put on", "tune",
+    ];
+    if !CONTEXT.iter().any(|w| t.contains(w)) {
+        return None;
+    }
+    let mut best: Option<(usize, String, String)> = None;
+    let mut tie = false;
+    for s in &cfg.radio_favorites {
+        let Some(url) = &s.url else { continue }; // only pinned favorites are fast
+        // Score = distinctive name words + aliases that appear in the transcript.
+        let mut score = radio_core_words(&s.name)
+            .iter()
+            .filter(|w| t.contains(w.as_str()))
+            .count();
+        for a in &s.aliases {
+            let a = normalize_radio(a);
+            if !a.is_empty() && t.contains(&a) {
+                score += 1;
+            }
+        }
+        if score == 0 {
+            continue;
+        }
+        match best {
+            Some((bs, _, _)) if score > bs => {
+                best = Some((score, s.name.clone(), url.clone()));
+                tie = false;
+            }
+            Some((bs, _, _)) if score == bs => tie = true,
+            Some(_) => {}
+            None => best = Some((score, s.name.clone(), url.clone())),
+        }
+    }
+    match best {
+        Some((_, name, url)) if !tie => Some((name, url)),
+        _ => None, // no match, or an ambiguous tie -> let the brain decide
+    }
+}
+
+/// Look up a station by name in Radio Browser; return its resolved stream URL.
+fn radio_browser_search(name: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("VoiceS3R/1.0")
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://de1.api.radio-browser.info/json/stations/search")
+        .query(&[
+            ("name", name),
+            ("limit", "1"),
+            ("hidebroken", "true"),
+            ("order", "clickcount"),
+            ("reverse", "true"),
+        ])
+        .send()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&resp.text().ok()?).ok()?;
+    let first = v.as_array()?.first()?;
+    let u = first["url_resolved"]
+        .as_str()
+        .or_else(|| first["url"].as_str())?;
+    u.starts_with("http").then(|| u.to_string())
+}
+
+/// Start (or switch to) a station: ffmpeg decodes the live stream to 16 kHz mono
+/// PCM; its stdout is handed to the radio-stream connection handler.
+fn start_radio(url: &str) -> bool {
+    stop_radio();
+    let ffmpeg = env_or("FFMPEG", "ffmpeg");
+    match Command::new(&ffmpeg)
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-i", url,
+            "-ac", "1", "-ar", "16000", "-f", "s16le", "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            *RADIO_STDOUT.lock().unwrap() = child.stdout.take();
+            *RADIO_CHILD.lock().unwrap() = Some(child);
+            true
+        }
+        Err(e) => {
+            log(&format!("[radio] ffmpeg spawn failed ({ffmpeg}): {e} — is ffmpeg on PATH?"));
+            false
+        }
+    }
+}
+
+/// Stop the current station (kill ffmpeg).
+fn stop_radio() {
+    if let Some(mut child) = RADIO_CHILD.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *RADIO_STDOUT.lock().unwrap() = None;
+}
+
+/// Serve audio to a device that entered speaker mode. The source is chosen at
+/// connect time: the current RADIO station's ffmpeg PCM if one is playing,
+/// otherwise the PC-audio loopback (the folded-in pc_speaker). Streams until the
+/// device disconnects (button press) or the source ends. One device at a time.
+fn speaker_stream_handler(mut sock: TcpStream) {
+    sock.set_nodelay(true).ok();
+    sock.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    let radio_active = RADIO_CHILD.lock().unwrap().is_some();
+
+    if radio_active {
+        // Radio: stream the station's ffmpeg PCM (started just before connect).
+        let mut src: Option<ChildStdout> = None;
+        for _ in 0..300 {
+            if let Some(o) = RADIO_STDOUT.lock().unwrap().take() {
+                src = Some(o);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let Some(mut src) = src else {
+            log("[radio] device connected but no station stdout");
+            return;
+        };
+        log("[radio] device connected — streaming station");
+        let mut buf = [0u8; 8192];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) => break, // ffmpeg ended (stream died)
+                Ok(n) => {
+                    if sock.write_all(&buf[..n]).is_err() {
+                        break; // device disconnected (button press)
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        log("[radio] device stream closed");
+        stop_radio();
+    } else {
+        // Plain speaker mode: mirror the PC's audio (WASAPI loopback).
+        log("[speaker] device connected — mirroring PC audio");
+        LOOPBACK_BUF.lock().unwrap().clear(); // start near-live
+        loop {
+            let chunk: Vec<u8> = {
+                let mut b = LOOPBACK_BUF.lock().unwrap();
+                let n = b.len().min(2048);
+                b.drain(..n).collect()
+            };
+            if chunk.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            if sock.write_all(&chunk).is_err() {
+                break; // device disconnected
+            }
+        }
+        log("[speaker] device disconnected");
+    }
+}
+
+/// Capture the PC's audio output (WASAPI loopback) into LOOPBACK_BUF as 16 kHz
+/// mono s16le — the old `pc_speaker`, folded into the server so plain speaker
+/// mode and radio share one process and port. Returns the live stream (the caller
+/// must keep it alive) or None if there's no/unsupported output device.
+fn start_loopback_capture() -> Option<cpal::Stream> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let host = cpal::default_host();
+    let device = match std::env::var("SPEAKER_DEVICE") {
+        Ok(want) if !want.trim().is_empty() => {
+            let want = want.to_lowercase();
+            host.output_devices()
+                .ok()
+                .and_then(|mut it| {
+                    it.find(|d| d.name().map(|n| n.to_lowercase().contains(&want)).unwrap_or(false))
+                })
+                .or_else(|| host.default_output_device())
+        }
+        _ => host.default_output_device(),
+    }?;
+    let name = device.name().unwrap_or_default();
+    let cfg = device.default_output_config().ok()?;
+    if cfg.sample_format() != cpal::SampleFormat::F32 {
+        log(&format!(
+            "[speaker] loopback: unsupported format {:?} on '{name}' — PC-audio mirroring off (radio still works)",
+            cfg.sample_format()
+        ));
+        return None;
+    }
+    let src_rate = cfg.sample_rate().0;
+    let channels = cfg.channels() as usize;
+    let ratio = src_rate as f32 / DEVICE_RATE as f32;
+    let cap = (DEVICE_RATE as usize) * 2; // ~0.5 s of mono bytes
+    let mut phase = 0f32;
+    let stream = device
+        .build_input_stream(
+            &cfg.clone().into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let ch = channels.max(1);
+                let frames = data.len() / ch;
+                let mut out = LOOPBACK_BUF.lock().unwrap();
+                let mut i = phase;
+                while (i as usize) < frames {
+                    let base = i as usize * ch;
+                    let mut s = 0f32;
+                    for c in 0..ch {
+                        s += data[base + c];
+                    }
+                    s /= ch as f32;
+                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    out.extend(v.to_le_bytes());
+                    i += ratio;
+                }
+                phase = i - frames as f32;
+                while out.len() > cap {
+                    out.pop_front();
+                }
+            },
+            |e| eprintln!("[speaker] loopback stream error: {e}"),
+            None,
+        )
+        .ok()?;
+    stream.play().ok()?;
+    log(&format!(
+        "[speaker] PC-audio loopback capturing '{name}' ({src_rate} Hz {channels}ch -> 16 kHz mono)"
+    ));
+    Some(stream)
 }
 
 /// OpenAI TTS (24 kHz PCM) resampled to the device's 16 kHz.
