@@ -1373,6 +1373,10 @@ fn hacker_mode_step(
             log("[hacker] exit");
             return Ok(Some(speak(if ru { "Выхожу из режима хакера." } else { "Exiting hacker mode." })?));
         }
+        // Silence/junk hallucination -> keep listening, don't generate a report.
+        if !is_meaningful_transcript(transcript) {
+            return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
+        }
         let t = Instant::now();
         let report = hacker_report(client, cfg, transcript)?;
         log(&format!("[hacker {:?}] {}", t.elapsed(), report.replace('\n', " ").trim()));
@@ -1458,8 +1462,10 @@ fn translate_mode_step(
             pcm: openai_tts(client, cfg, &persona.voice, say)?,
         }));
     }
-    if transcript.trim().is_empty() {
-        // Silence/pause — stay in the mode and keep listening (0xFD).
+    // Silence/junk: Whisper hallucinates "." / stock phrases / foreign script on
+    // silence — don't translate or speak that, just keep listening (0xFD).
+    if !is_meaningful_transcript(transcript) {
+        log("[translate] skip (silence/junk)");
         return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
     }
     let target = TRANSLATE_TARGET.lock().unwrap().clone();
@@ -1550,6 +1556,10 @@ fn coding_mode_step(
             CODING_MODE.store(false, Ordering::Relaxed);
             log("[coding] exit");
             return Ok(Some(speak("Exited coding mode.")?));
+        }
+        // Silence/junk hallucination -> keep listening, don't run a Claude turn.
+        if !is_meaningful_transcript(transcript) {
+            return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
         }
         // Route the spoken command to the persistent Claude Code session.
         let continue_session = CODING_STARTED.swap(true, Ordering::Relaxed);

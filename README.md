@@ -158,13 +158,22 @@ In `skills` mode, say **"переводи на английский"** / **"tran
 language; after that the device **keeps listening** (no wake word) and every phrase
 you say is translated (**Google Cloud Translation**) and **spoken back** in the
 target language by the persona voice — no LLM in the loop, so it's fast
-(~3–4 s/phrase). The source language is auto-detected, so you can switch languages
-freely.
+(~3–4 s/phrase). The source language is auto-detected — but you **speak** Russian
+or English (the **target** can be any language Google supports, e.g. `es`, `de`,
+`fr`, `it`).
 
 Leave it with **"выйти из перевода" / "stop translate"** or the **button**. To
 change the target, exit and re-enter ("переводи на немецкий").
 
 Needs **`GOOGLE_TRANSLATE_API_KEY`** in `.env`.
+
+> **Languages — Russian & English only (by design).** All voice modes drop input
+> in non-Latin/Cyrillic scripts (CJK / Japanese / Korean / Arabic / Thai / Hebrew /
+> Devanagari): on silence Whisper hallucinates such text, and filtering it
+> (`has_foreign_script` / `is_meaningful_transcript`) is what stops phantom loops.
+> So you can **translate _to_** those languages, but **not speak _from_** them. This
+> tool is tuned for a RU/EN audience on purpose; speakers of other languages can
+> relax that filter themselves.
 
 ## Hacker mode (just for fun)
 
