@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::windows::process::CommandExt; // creation_flags (CREATE_NO_WINDOW)
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -39,6 +40,13 @@ static LAST_VOLUME: std::sync::Mutex<u8> = std::sync::Mutex::new(75);
 static CODING_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Whether the current coding-mode session has been started (controls --continue).
 static CODING_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Chat mode ("just talk"): while true, spoken utterances are routed to a
+/// persistent Claude conversation (web search, but NO file/shell tools) in a
+/// separate thread — the voice equivalent of the desktop app's "Chat" tab.
+static CHAT_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the current chat session has been started (controls --continue).
+static CHAT_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// HACKER mode (entertainment): while true, every utterance is answered with an
 /// absurd, over-the-top FICTIONAL "successful hack" report. Pure comedy — never
@@ -67,6 +75,16 @@ static TYPE_INTO_FOCUS: std::sync::atomic::AtomicBool =
 /// on its own line), 2 = none (joined). Voice-configurable. Default = newline
 /// (each phrase on a new line, no spaces added).
 static TRANSCRIBE_SEP: AtomicU8 = AtomicU8::new(1);
+/// Whether the current dictation session has typed its first phrase. The first
+/// phrase gets NO leading separator; every phrase after it gets the separator in
+/// front. Reset to false when a transcribe session starts.
+static DICTATION_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Live-dictation delivery method: 0 = paste (clipboard + Ctrl+V), 1 = type
+/// (native Win32 SendInput). Paste is the default — a PASTED newline is dropped
+/// by single-line fields (e.g. a search box), whereas a synthesized Enter /
+/// Shift+Enter can submit them. Config: DICTATION_METHOD; voice-switchable.
+static DICTATION_METHOD: AtomicU8 = AtomicU8::new(0);
 
 /// Device→server header bit (OR'd into the persona byte): "button pressed — leave
 /// transcribe mode". The accompanying utterance is empty.
@@ -164,6 +182,7 @@ struct Config {
     agent: bool, // allow voice commands to run PC actions (with spoken confirmation)
     debug_wav: bool,
     code_dir: String, // project folder for voice "coding mode" (M6)
+    chat_dir: String, // separate folder for voice "chat mode" (own --continue thread)
     tts_voice_jarvis: String, // OpenAI TTS voice for the male "Jarvis" persona
     transcribe_timeout_secs: u64, // auto-leave transcribe mode after this much silence
     realtime_model: String, // OpenAI Realtime transcription model (external streaming)
@@ -311,6 +330,15 @@ fn main() -> Result<()> {
         agent: env_or("AGENT", "1") != "0",
         debug_wav: std::env::var("DEBUG_WAV").is_ok(),
         code_dir: env_or("CODE_DIR", "C:/Users/gravi/voice-code"),
+        chat_dir: {
+            // Own directory so chat's `--continue` thread stays separate from coding's.
+            let c = env_or("CHAT_DIR", "");
+            if c.trim().is_empty() {
+                std::env::temp_dir().join("s3r_chat").to_string_lossy().into_owned()
+            } else {
+                c
+            }
+        },
         tts_voice_jarvis: env_or("TTS_VOICE_JARVIS", "onyx"),
         transcribe_timeout_secs: env_or("TRANSCRIBE_TIMEOUT", "60").parse().unwrap_or(60),
         realtime_model: env_or("REALTIME_MODEL", "gpt-4o-transcribe"),
@@ -321,11 +349,32 @@ fn main() -> Result<()> {
         compressor_net: env_or("COMPRESSOR_NET", "192.168.3.").trim().to_string(),
     };
 
-    // Live dictation: paste transcripts into the focused field (Ctrl+V).
+    // Live dictation: type transcripts into the focused field.
     // Default ON — only an explicit 0/false/no/off disables it.
     let tf = env_or("TYPE_INTO_FOCUS", "").trim().to_lowercase();
     let type_focus = !matches!(tf.as_str(), "0" | "false" | "no" | "off");
     TYPE_INTO_FOCUS.store(type_focus, Ordering::Relaxed);
+
+    // Transcribe-mode separator between dictated phrases. Default = NEW LINE
+    // (each phrase on its own line). Voice command "настройки для транскрибации"
+    // can change it at runtime; this just sets the startup value from the config.
+    let sep = env_or("TRANSCRIBE_SEP", "").trim().to_lowercase();
+    let sep_val: u8 = match sep.as_str() {
+        "space" | "пробел" | "0" => 0,
+        "none" | "joined" | "слитно" | "no" | "2" => 2,
+        _ => 1, // newline (default; also "newline"/"line"/"новая строка"/"1"/empty)
+    };
+    TRANSCRIBE_SEP.store(sep_val, Ordering::Relaxed);
+
+    // Live-dictation delivery method. Default = paste (clipboard + Ctrl+V); a
+    // pasted newline doesn't submit single-line fields. "type" uses native
+    // Win32 SendInput. Voice-switchable at runtime.
+    let dm = env_or("DICTATION_METHOD", "").trim().to_lowercase();
+    let method_val: u8 = match dm.as_str() {
+        "type" | "native" | "sendinput" | "keys" | "1" => 1,
+        _ => 0, // paste / clipboard / ctrl+v / empty (default)
+    };
+    DICTATION_METHOD.store(method_val, Ordering::Relaxed);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
@@ -345,14 +394,24 @@ fn main() -> Result<()> {
         )),
         "skills" => {
             std::fs::create_dir_all(&cfg.code_dir).ok();
+            std::fs::create_dir_all(&cfg.chat_dir).ok();
             log(&format!(
                 "Skills agent: STT=OpenAI {} | brain=claude CLI (web search) | TTS=OpenAI {} voice={}",
                 cfg.stt_model, cfg.tts_model, cfg.tts_voice_sophia
             ));
             log(&format!("Coding mode (M6) project dir: {}", cfg.code_dir));
+            log(&format!("Chat mode (talk + web search) dir: {}", cfg.chat_dir));
             log(&format!("Transcribe mode idle timeout: {}s", cfg.transcribe_timeout_secs));
             if type_focus {
-                log("Live dictation: ON — transcripts are pasted (Ctrl+V) into the focused field");
+                let sep_name = match sep_val {
+                    0 => "space",
+                    2 => "none",
+                    _ => "newline",
+                };
+                let method_name = if method_val == 1 { "type (SendInput)" } else { "paste (Ctrl+V)" };
+                log(&format!(
+                    "Live dictation: ON — into the focused field (method: {method_name}, separator: {sep_name})"
+                ));
             }
             if !cfg.google_translate_key.is_empty() {
                 log("Translate mode: ready (Google Translate)");
@@ -464,6 +523,7 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         TRANSLATE_MODE.store(false, Ordering::Relaxed);
         HACKER_MODE.store(false, Ordering::Relaxed);
         CODING_MODE.store(false, Ordering::Relaxed);
+        CHAT_MODE.store(false, Ordering::Relaxed);
         log("[exit] button — back to wake-word listening");
         let pcm = transcribe_off_pcm(cfg, &persona);
         stream.write_all(&[CTRL_NONE]).ok();
@@ -921,6 +981,21 @@ fn transcribe_settings_step(
             log("[type] separator = none");
             return speak("Готово, без разделителя.");
         }
+        // Delivery method: paste (Ctrl+V) vs native key typing.
+        if t.contains("ctrl") || t.contains("контрол") || t.contains("вставк")
+            || t.contains("буфер") || t.contains("paste")
+        {
+            DICTATION_METHOD.store(0, Ordering::Relaxed);
+            log("[type] method = paste (Ctrl+V)");
+            return speak("Готово, вставка через Ctrl+V.");
+        }
+        if t.contains("нативн") || t.contains("клавиш") || t.contains("native")
+            || t.contains("sendinput") || t.contains("печать клавиш")
+        {
+            DICTATION_METHOD.store(1, Ordering::Relaxed);
+            log("[type] method = type (SendInput)");
+            return speak("Готово, набор клавишами.");
+        }
     }
 
     // Paste-into-field on/off.
@@ -993,6 +1068,7 @@ fn copy_to_clipboard(text: &str) -> bool {
     );
     Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1017,34 +1093,154 @@ fn print_transcript(text: &str) {
 /// (Ctrl+V) into whatever Windows field has focus — with a trailing space so
 /// consecutive dictated phrases don't run together.
 fn deliver_transcript(text: &str) {
+    let sep = TRANSCRIBE_SEP.load(Ordering::Relaxed);
+    let mut text = text.trim().to_string();
+    // In newline mode each phrase is its own line, so the period Whisper appends to
+    // declarative sentences is just noise — drop a trailing '.' (and ellipsis). Keep
+    // '?' and '!' (they carry meaning). In space/joined modes it reads as running
+    // prose, so the period stays.
+    if sep == 1 {
+        while text.ends_with('.') {
+            text.pop();
+        }
+        text = text.trim_end().to_string();
+    }
+    if text.is_empty() {
+        return;
+    }
     if TYPE_INTO_FOCUS.load(Ordering::Relaxed) {
-        // Leading separator so consecutive phrases don't run together (leading,
-        // not trailing — some fields trim trailing whitespace).
-        let prefix = match TRANSCRIBE_SEP.load(Ordering::Relaxed) {
-            1 => "\n", // each phrase on a new line
-            2 => "",   // joined, no separator
-            _ => " ",  // space (default)
+        // First phrase of the session: no leading separator. Every phrase after it
+        // gets the separator in front (newline / space / nothing).
+        let first = !DICTATION_STARTED.swap(true, Ordering::Relaxed);
+        let prefix = if first {
+            ""
+        } else {
+            match sep {
+                1 => "\n", // new line: a literal '\n' for paste, Shift+Enter for type
+                2 => "",   // joined, no separator
+                _ => " ",  // space
+            }
         };
-        if copy_to_clipboard(&format!("{prefix}{text}")) {
-            send_ctrl_v();
+        let payload = format!("{prefix}{text}");
+        if DICTATION_METHOD.load(Ordering::Relaxed) == 1 {
+            // Native key injection (Win32 SendInput).
+            type_into_focus(&payload);
+            let _ = copy_to_clipboard(&text); // keep clipboard for a manual paste
+        } else {
+            // Clipboard + Ctrl+V (default). A pasted newline doesn't submit
+            // single-line fields, so this is the safest for search boxes.
+            if !paste_into_focus(&payload) {
+                log("[type] paste failed — text left on clipboard, paste manually");
+            }
         }
     } else {
-        copy_to_clipboard(text);
+        copy_to_clipboard(&text);
     }
 }
 
-/// Send Ctrl+V to the foreground window (pastes the clipboard into the focused field).
-fn send_ctrl_v() {
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')",
-        ])
+/// Put `text` on the clipboard AND paste it (Ctrl+V) into the focused window, in
+/// ONE hidden PowerShell call (CREATE_NO_WINDOW so it never flashes a console or
+/// steals focus). A short delay lets the clipboard settle before the keystroke.
+/// Unlike native key injection, a pasted newline is dropped by single-line fields
+/// (e.g. a search box) instead of submitting them. Best-effort; returns success.
+fn paste_into_focus(text: &str) -> bool {
+    let tmp = std::env::temp_dir().join("s3r_transcript.txt");
+    if std::fs::write(&tmp, text).is_err() {
+        return false;
+    }
+    let cmd = format!(
+        "Set-Clipboard -Value (Get-Content -Raw -Encoding UTF8 -LiteralPath '{}'); \
+         Add-Type -AssemblyName System.Windows.Forms; \
+         Start-Sleep -Milliseconds 40; \
+         [System.Windows.Forms.SendKeys]::SendWait('^v')",
+        tmp.display()
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// One synthesized keyboard event (Win32 `INPUT`, keyboard variant; 40 bytes on x64).
+#[repr(C)]
+struct KeyInput {
+    type_: u32,
+    _align: u32,
+    w_vk: u16,
+    w_scan: u16,
+    dw_flags: u32,
+    time: u32,
+    dw_extra_info: usize,
+    _pad: u64,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn SendInput(c_inputs: u32, p_inputs: *const KeyInput, cb_size: i32) -> u32;
+}
+
+/// Type `text` directly into the focused field via Win32 `SendInput` (Unicode) —
+/// no clipboard, no subprocess, no focus stealing. Types into whatever window the
+/// user has focused, exactly like real dictation software; handles Cyrillic.
+fn type_into_focus(text: &str) {
+    const INPUT_KEYBOARD: u32 = 1;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const KEYEVENTF_UNICODE: u32 = 0x0004;
+    const VK_RETURN: u16 = 0x0D;
+    const VK_SHIFT: u16 = 0x10;
+    // A character typed via its Unicode code unit (any letter, incl. Cyrillic).
+    let unicode = |scan: u16, up: bool| KeyInput {
+        type_: INPUT_KEYBOARD,
+        _align: 0,
+        w_vk: 0,
+        w_scan: scan,
+        dw_flags: KEYEVENTF_UNICODE | if up { KEYEVENTF_KEYUP } else { 0 },
+        time: 0,
+        dw_extra_info: 0,
+        _pad: 0,
+    };
+    // A virtual-key press. Used for the newline separator as SHIFT+ENTER (a "soft"
+    // line break): in chat-style fields (messengers, search) plain Enter would
+    // SUBMIT, whereas Shift+Enter inserts a new line without sending; in plain text
+    // editors it's just a normal new line. Typing the Unicode \n char alone is
+    // ignored by most fields, so a real key press is required.
+    let vkey = |vk: u16, up: bool| KeyInput {
+        type_: INPUT_KEYBOARD,
+        _align: 0,
+        w_vk: vk,
+        w_scan: 0,
+        dw_flags: if up { KEYEVENTF_KEYUP } else { 0 },
+        time: 0,
+        dw_extra_info: 0,
+        _pad: 0,
+    };
+    let mut inputs: Vec<KeyInput> = Vec::new();
+    for u in text.encode_utf16() {
+        if u == 0x000A || u == 0x000D {
+            // Shift down, Enter down, Enter up, Shift up.
+            inputs.push(vkey(VK_SHIFT, false));
+            inputs.push(vkey(VK_RETURN, false));
+            inputs.push(vkey(VK_RETURN, true));
+            inputs.push(vkey(VK_SHIFT, true));
+        } else {
+            inputs.push(unicode(u, false)); // key down
+            inputs.push(unicode(u, true)); // key up
+        }
+    }
+    if inputs.is_empty() {
+        return;
+    }
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<KeyInput>() as i32,
+        );
+    }
 }
 
 /// Filter out empty / punctuation-only segments and Whisper's well-known
@@ -1104,6 +1300,8 @@ fn transcribe_stream_handler(mut stream: TcpStream, cfg: std::sync::Arc<Config>)
         return Ok(());
     }
     let persona = Persona::from_byte(head[0] & 0x7F, &cfg);
+    // New session: the first dictated phrase gets no leading separator.
+    DICTATION_STARTED.store(false, Ordering::Relaxed);
     log(&format!("[stream] transcribe session start (persona {})", persona.name));
     // OpenAI Realtime (word-by-word). If the websocket can't be established —
     // bad/expired/missing API key, no access, network down — fall back to
@@ -1460,18 +1658,62 @@ fn is_translate_exit(t: &str) -> bool {
     ru || en || t.contains("хватит переводить")
 }
 
-/// While translate mode is on, translate the utterance and speak it. Returns None
-/// to fall through to the normal skills.
+/// True if the utterance asks to START translate mode WITHOUT naming a specific
+/// target language ("переводчик" / "режим перевода" / "translate mode" / "turn on
+/// translate"). These enter bidirectional RU↔EN. A request that names a language
+/// ("переводи на немецкий") is NOT matched here — it falls through to the brain,
+/// which sets a fixed target.
+fn is_translate_enter(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("режим перевод")
+        || t.contains("режим переводчик")
+        || t.contains("включи перевод")
+        || t.contains("включи переводчик")
+        || t.contains("запусти перевод")
+        || t.contains("переводчик")
+        || t.contains("translate mode")
+        || t.contains("turn on translate")
+        || t.contains("start translat")
+        || t.contains("let's translate")
+}
+
+/// Translate-mode router: enter (bidirectional RU↔EN) on a generic request, and
+/// while active translate each utterance and speak it. Returns None to fall
+/// through to the normal skills (incl. the brain's named-language translate).
 fn translate_mode_step(
     client: &reqwest::blocking::Client,
     cfg: &Config,
     persona: &Persona,
     transcript: &str,
 ) -> Result<Option<Response>> {
+    let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+
     if !TRANSLATE_MODE.load(Ordering::Relaxed) {
+        // Generic "translate mode" (no language named) → bidirectional RU↔EN.
+        if is_translate_enter(transcript) {
+            if cfg.google_translate_key.is_empty() {
+                let msg = if ru { "Ключ переводчика не задан." } else { "Translation key is not set." };
+                return Ok(Some(Response {
+                    control: CTRL_NONE,
+                    pcm: openai_tts(client, cfg, &persona.voice, msg)?,
+                }));
+            }
+            TRANSLATE_MODE.store(true, Ordering::Relaxed);
+            *TRANSLATE_TARGET.lock().unwrap() = "auto".to_string();
+            log("[translate] enter (auto RU↔EN)");
+            let say = if ru {
+                "Режим перевода включён. Перевожу между русским и английским."
+            } else {
+                "Translate mode on. I'll translate between English and Russian."
+            };
+            return Ok(Some(Response {
+                control: CTRL_TRANSCRIBE,
+                pcm: openai_tts(client, cfg, &persona.voice, say)?,
+            }));
+        }
         return Ok(None);
     }
-    let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+
     if is_translate_exit(transcript) {
         TRANSLATE_MODE.store(false, Ordering::Relaxed);
         log("[translate] exit");
@@ -1487,9 +1729,16 @@ fn translate_mode_step(
         log("[translate] skip (silence/junk)");
         return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
     }
-    let target = TRANSLATE_TARGET.lock().unwrap().clone();
+    // Auto mode translates by source language (RU→EN, EN→RU). A fixed target set
+    // by the brain for a named language overrides it.
+    let target_cfg = TRANSLATE_TARGET.lock().unwrap().clone();
+    let target = if target_cfg.is_empty() || target_cfg == "auto" {
+        if ru { "en" } else { "ru" }
+    } else {
+        target_cfg.as_str()
+    };
     let t = Instant::now();
-    let translated = google_translate(client, cfg, transcript, &target)?;
+    let translated = google_translate(client, cfg, transcript, target)?;
     log(&format!("[translate -> {target} {:?}] {translated}", t.elapsed()));
     let say = if translated.trim().is_empty() { transcript.to_string() } else { translated };
     // 0xFD => after speaking the translation, listen again immediately.
@@ -1632,8 +1881,6 @@ fn run_claude_coding(
     // stream-json lets us log Claude's actions (commands, edits, narration) live
     // in the terminal as they happen, while still returning the final summary.
     let mut args: Vec<&str> = vec![
-        "/C",
-        "claude",
         "-p",
         "--dangerously-skip-permissions",
         "--output-format",
@@ -1643,14 +1890,24 @@ fn run_claude_coding(
     if continue_session {
         args.push("--continue");
     }
+    claude_exec(&args, code_dir, &prompt)
+}
+
+/// Spawn `cmd /C claude <args>`, feed `prompt` on stdin, parse the stream-json
+/// output (logging Claude's text + tool calls live in the terminal), and return
+/// the final result text. Shared by coding mode (full tools, skip permissions)
+/// and chat mode (talk + web search only).
+fn claude_exec(args: &[&str], dir: &str, prompt: &str) -> Result<String> {
     let mut child = Command::new("cmd")
-        .args(&args)
-        .current_dir(code_dir)
+        .arg("/C")
+        .arg("claude")
+        .args(args)
+        .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("spawn claude (coding mode) in {code_dir}"))?;
+        .with_context(|| format!("spawn claude in {dir}"))?;
     child
         .stdin
         .take()
@@ -1701,6 +1958,134 @@ fn run_claude_coding(
     }
     let _ = child.wait();
     Ok(final_text)
+}
+
+// ── Chat mode ("just talk") ──────────────────────────────────────────────────
+// The voice equivalent of the desktop app's "Chat" tab (vs "Code"). Same
+// persistent-Claude-session machinery as coding mode, but invoked WITHOUT
+// file/shell tools (web search only) and in its OWN directory, so its
+// `--continue` thread stays separate from coding's. The CLI itself doesn't
+// distinguish "chat" from "code" — the difference is entirely how we invoke it:
+// tools off + neutral dir + conversational prompt.
+
+fn is_chat_enter(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("режим разговор")
+        || t.contains("режим бесед")
+        || t.contains("режим чат")
+        || t.contains("давай поговор")
+        || t.contains("давай поболта")
+        || t.contains("поболтаем")
+        || t.contains("chat mode")
+        || t.contains("let's chat")
+        || t.contains("let's talk")
+}
+
+fn is_chat_exit(t: &str) -> bool {
+    let t = t.to_lowercase();
+    t.contains("выйти из разговор")
+        || t.contains("выйти из бесед")
+        || t.contains("выйти из чат")
+        || t.contains("закончить разговор")
+        || t.contains("закончить бесед")
+        || t.contains("стоп разговор")
+        || t.contains("exit chat")
+        || t.contains("stop chat")
+        || t.contains("leave chat")
+}
+
+/// If a chat-mode toggle, or we're already in chat mode, handle it and return the
+/// spoken Response. Returns None to fall through to the normal skills.
+fn chat_mode_step(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    persona: &Persona,
+    transcript: &str,
+) -> Result<Option<Response>> {
+    let speak = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+    };
+    // 0xFD => the device listens again immediately (no wake word) — stays in chat.
+    let speak_keep = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_TRANSCRIBE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+    };
+
+    if CHAT_MODE.load(Ordering::Relaxed) {
+        if is_chat_exit(transcript) {
+            CHAT_MODE.store(false, Ordering::Relaxed);
+            log("[chat] exit");
+            let bye = if is_cyrillic(transcript) {
+                "Вышла из режима разговора."
+            } else {
+                "Exited chat mode."
+            };
+            return Ok(Some(speak(bye)?));
+        }
+        // Silence / hallucinated junk -> keep listening, don't run a turn.
+        if !is_meaningful_transcript(transcript) {
+            return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
+        }
+        let continue_session = CHAT_STARTED.swap(true, Ordering::Relaxed);
+        let t = Instant::now();
+        log(&format!("[chat] {} (continue={continue_session})", transcript));
+        let reply = run_claude_chat(transcript, &cfg.chat_dir, continue_session, persona)?;
+        log(&format!("[chat {:?}] {}", t.elapsed(), reply.replace('\n', " ").trim()));
+        let say = clean_for_speech(&reply);
+        let say = if say.is_empty() {
+            if is_cyrillic(transcript) { "Слушаю.".to_string() } else { "Go on.".to_string() }
+        } else {
+            say
+        };
+        return Ok(Some(speak_keep(&say)?));
+    }
+
+    if is_chat_enter(transcript) {
+        CHAT_MODE.store(true, Ordering::Relaxed);
+        CHAT_STARTED.store(false, Ordering::Relaxed); // next utterance starts a fresh thread
+        log("[chat] enter");
+        let hi = if is_cyrillic(transcript) {
+            "Режим разговора включён. О чём поговорим?"
+        } else {
+            "Chat mode on. What's on your mind?"
+        };
+        return Ok(Some(speak_keep(hi)?));
+    }
+
+    Ok(None)
+}
+
+/// One turn of the persistent chat session: Claude via the CLI with NO file/shell
+/// tools (only web search), in `chat_dir` (its own `--continue` thread). Returns
+/// the spoken reply.
+fn run_claude_chat(
+    transcript: &str,
+    chat_dir: &str,
+    continue_session: bool,
+    persona: &Persona,
+) -> Result<String> {
+    let intro = persona.skills_intro;
+    let prompt = format!(
+        "{intro} You are having a relaxed, spoken VOICE CONVERSATION with the user — like \
+         chatting with a friend across the room. They hear you through a small speaker and are \
+         usually NOT looking at a screen, so speak naturally: 1-3 short sentences, plain \
+         conversational speech, NO markdown, NO code, NO lists, NO file paths, NO emojis. You \
+         may use web search when they ask about fresh or factual things; otherwise just talk. \
+         Do NOT edit files or run shell commands. ALWAYS reply in the SAME language the user \
+         spoke (Russian → Russian, English → English).\n\n\
+         User said: {transcript}"
+    );
+    let mut args: Vec<&str> = vec![
+        "-p",
+        "--allowedTools",
+        "WebSearch,WebFetch",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ];
+    if continue_session {
+        args.push("--continue");
+    }
+    claude_exec(&args, chat_dir, &prompt)
 }
 
 /// One-line description of a Claude tool call for the live log.
@@ -1869,6 +2254,13 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         };
         let pcm = openai_tts(&client, cfg, &persona.voice, say)?;
         return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
+    }
+
+    // Chat mode ("just talk") — if active (or being entered), route to Claude with
+    // web search but no file/shell tools. Checked early so an active chat session
+    // captures every utterance before the other mode-routers can mis-trigger.
+    if let Some(resp) = chat_mode_step(&client, cfg, persona, &transcript)? {
+        return Ok(resp);
     }
 
     // Translate mode — while active, translate each utterance and speak it back.

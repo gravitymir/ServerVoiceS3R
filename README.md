@@ -35,19 +35,74 @@ The old separate `pc_speaker.exe` is now folded in — just run the one server.
    ```
 2. Put a **`.env`** file next to the exe — `target\release\.env` — so you don't
    pass settings on the command line each run (the server reads it automatically;
-   real environment variables override it):
+   real environment variables override it). Copy the template below and fill in
+   your keys (everything except `OPENAI_API_KEY` is optional):
+
    ```ini
-   MODE=skills
-   OPENAI_API_KEY=<your-openai-api-key>
-   GOOGLE_TRANSLATE_API_KEY=<optional — only for translate mode>
-   TTS_VOICE_SOPHIA=nova
-   TTS_VOICE_JARVIS=onyx
-   TTS_SPEED=1.4
+   # ServerVoiceS3R configuration — save as target/release/.env (next to the exe).
+   # KEY=VALUE per line, '#' begins a comment. Real environment variables override it.
+
+   # --- Mode ---
+   MODE=skills                  # skills | windows | openai | loopback
+
+   # --- Keys (fill these in) ---
+   OPENAI_API_KEY=              # required for skills/openai (Whisper STT + OpenAI TTS)
+   GOOGLE_TRANSLATE_API_KEY=    # required only for translate mode (Google Cloud Translation)
+
+   # --- Voices (per persona / wake word) ---
+   TTS_VOICE_SOPHIA=nova        # "Sophia" persona (female)
+   TTS_VOICE_JARVIS=onyx        # "Jarvis" persona (male)
+   TTS_SPEED=1.4                # 0.25–4.0 (higher = faster)
+
+   # --- Voice coding mode (M6) ---
    CODE_DIR=C:/Users/you/voice-code
+
+   # --- Chat mode ("just talk") ---
+   # CHAT_DIR=                  # own folder for chat's --continue thread (default: %TEMP%/s3r_chat)
+
+   # --- Live dictation (transcribe mode) ---
+   TYPE_INTO_FOCUS=1            # put each transcribed phrase into the focused field (on by default)
+   DICTATION_METHOD=paste       # delivery: paste (Ctrl+V, default) | type (native SendInput)
+   TRANSCRIBE_SEP=newline       # separator between phrases: newline (default) | space | none
+   TRANSCRIBE_TIMEOUT=60        # seconds of silence before chunked transcribe auto-exits
+
+   # --- Transcription (OpenAI Realtime streaming) ---
+   REALTIME_MODEL=gpt-4o-transcribe
+   REALTIME_SILENCE_MS=1500     # server-VAD silence (ms) before a phrase is finalized
+   # REALTIME_DEBUG=1           # log every Realtime websocket event
+
+   # --- Compressor (StamPLC HTTP relay) — optional, network-gated ---
+   # Voice: "включи/выключи компрессор". Only acts when this PC's local IP starts
+   # with COMPRESSOR_NET (i.e. you're on the service LAN); elsewhere it's inert.
+   # COMPRESSOR_HOST=192.168.3.75
+   # COMPRESSOR_NET=192.168.3.
+
+   # --- Online-radio favorites (RADIO_FAV_1..20) ---
+   # Formats:  Name  |  Name | url  |  Name | url | alias1, alias2
+   # A pinned URL plays instantly (no web search); aliases add extra spoken names
+   # (e.g. Latin spellings so an English request matches a Cyrillic station).
+   RADIO_FAV_1=Ретро FM | http://retroserver.streamr.ru:8043/retro256.mp3 | retro
+   RADIO_FAV_2=Кис ФМ | http://online.kissfm.ua/KissFM | kiss, kis
+   RADIO_FAV_3=Европа Плюс | http://ep256.hostingradio.ru:8052/europaplus256.mp3 | europa, europe, evropa
+   RADIO_FAV_4=Дорожное радио | https://dorognoe.hostingradio.ru/dorognoe | dorozhnoe, dorognoe
+   RADIO_FAV_5=Hit FM Ukraine | http://online.hitfm.ua/HitFM | hit fm
+   RADIO_FAV_6=Live 95 Limerick | https://wg.cdn.tibus.net/Live95fm | live 95, life 95
+   RADIO_FAV_7=RTE Radio 1 | http://icecast.rte.ie/radio1
+   RADIO_FAV_8=Today FM | https://stream.audioxi.com/TD
+   RADIO_FAV_9=Newstalk | https://edge.audioxi.com/NT
+   RADIO_FAV_10=Classic Hits | http://stream.audioxi.com/CLASSIC
+   RADIO_FAV_11=Red FM | https://live-bauerie.sharp-stream.com/RED
+   RADIO_FAV_12=96FM | http://wg.cdn.tibus.net/96fm
+
+   # --- Optional (defaults shown) ---
+   # PORT=9000
+   # CHAT_MODEL=gpt-4o-mini
+   # TTS_MODEL=gpt-4o-mini-tts
+   # STT_MODEL=whisper-1
+   # FFMPEG=ffmpeg                       # ffmpeg path (online radio)
+   # SPEAKER_DEVICE=Speakers             # output-device name substring for PC-audio mirroring
+   # STT_ENGINE=sapi                     # windows mode STT (Windows System.Speech)
    ```
-   A full template with every setting (radio favorites, live dictation, …) is in
-   **[`.env.example`](.env.example)** — copy it to `target\release\.env` and fill in
-   your keys.
 3. Start it:
    ```powershell
    .\target\release\server_voice_s3r.exe
@@ -249,9 +304,12 @@ per line, `#` comments; real environment variables take precedence.
 | `TTS_VOICE_JARVIS` | `onyx` | OpenAI TTS voice for the **Jarvis** persona (`onyx`, `echo`, `ash`) |
 | `TTS_SPEED` | `1.3` | Speech rate (0.25–4.0; higher = faster) |
 | `CODE_DIR` | `C:/Users/gravi/voice-code` | Project folder for voice coding mode (M6) |
+| `CHAT_DIR` | `%TEMP%/s3r_chat` | Folder for chat mode's separate `--continue` thread |
 | `TRANSCRIBE_TIMEOUT` | `60` | Seconds of silence before (chunked) transcribe mode auto-exits |
 | `REALTIME_MODEL` | `gpt-4o-transcribe` | OpenAI Realtime transcription model (streaming dictation) |
-| `TYPE_INTO_FOCUS` | **on** | Live dictation: paste each transcribed phrase (Ctrl+V) into the focused field. On by default; set `0` to disable. Toggle by voice: "включи/выключи печать в поле". |
+| `TYPE_INTO_FOCUS` | **on** | Live dictation: put each transcribed phrase into the focused field. On by default; set `0` to disable. Toggle by voice: "включи/выключи печать в поле". |
+| `DICTATION_METHOD` | `paste` | Dictation delivery: `paste` (clipboard + Ctrl+V — a pasted newline won't submit search boxes) or `type` (native Win32 SendInput). Voice-switchable. |
+| `TRANSCRIBE_SEP` | `newline` | Separator between dictated phrases: `newline` \| `space` \| `none`. Voice-switchable. |
 | `REALTIME_SILENCE_MS` | `1500` | Realtime server-VAD silence (ms) before finalizing a phrase |
 | `REALTIME_DEBUG` | unset | If `1`, log every Realtime websocket event |
 | `STT_MODEL` | `whisper-1` | OpenAI transcription model (command recognition) |
