@@ -253,6 +253,14 @@ fn load_dotenv() {
             if let Some((k, v)) = line.split_once('=') {
                 let k = k.trim();
                 let mut v = v.trim();
+                // Strip an inline comment: a '#' that follows whitespace (so a '#'
+                // inside a value, e.g. a URL fragment, without a space is kept).
+                if let Some(i) = v
+                    .char_indices()
+                    .find_map(|(i, c)| (c == '#' && v[..i].ends_with([' ', '\t'])).then_some(i))
+                {
+                    v = v[..i].trim_end();
+                }
                 if v.len() >= 2
                     && ((v.starts_with('"') && v.ends_with('"'))
                         || (v.starts_with('\'') && v.ends_with('\'')))
@@ -314,8 +322,9 @@ fn main() -> Result<()> {
     };
 
     // Live dictation: paste transcripts into the focused field (Ctrl+V).
+    // Default ON — only an explicit 0/false/no/off disables it.
     let tf = env_or("TYPE_INTO_FOCUS", "").trim().to_lowercase();
-    let type_focus = !matches!(tf.as_str(), "" | "0" | "false" | "no" | "off");
+    let type_focus = !matches!(tf.as_str(), "0" | "false" | "no" | "off");
     TYPE_INTO_FOCUS.store(type_focus, Ordering::Relaxed);
 
     let addr = format!("0.0.0.0:{}", cfg.port);
@@ -1853,7 +1862,12 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
     // yet) enters this OpenAI streaming mode.
     if is_external_transcribe(&transcript) || is_transcribe_enter(&transcript) {
         log("[transcribe] enter STREAMING (OpenAI Realtime) — dictate freely; button exits");
-        let pcm = openai_tts(&client, cfg, &persona.voice, "Transcribe mode on. Speak now.")?;
+        let say = if is_cyrillic(&transcript) {
+            "Режим транскрибации включён. Говорите."
+        } else {
+            "Transcribe mode on. Speak now."
+        };
+        let pcm = openai_tts(&client, cfg, &persona.voice, say)?;
         return Ok(Response { control: CTRL_STREAM_EXTERNAL, pcm });
     }
 
@@ -1883,10 +1897,8 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         if probe_stream(&url) {
             log(&format!("[skill] radio (fast path) -> \"{name}\" @ {url}"));
             start_radio(&url);
-            let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
-            let say = if ru { format!("Включаю {name}.") } else { format!("Playing {name}.") };
-            let pcm = openai_tts(&client, cfg, &persona.voice, &say)?;
-            return Ok(Response { control: CTRL_SPEAKER, pcm });
+            // Success: just start playing, no spoken confirmation.
+            return Ok(Response { control: CTRL_SPEAKER, pcm: Vec::new() });
         }
         log(&format!("[skill] radio fast-path '{name}' not live — falling back to brain"));
     }
@@ -1935,6 +1947,7 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
             Ok(Response { control, pcm })
         }
         "radio" => {
+            let ru = is_cyrillic(&transcript); // reply (errors only) in the request's language
             let query = json_str(&raw, "query");
             let url = json_str(&raw, "url");
             // No specific station ("онлайн-радио" / "список") -> read favorites aloud.
@@ -1944,9 +1957,12 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
                 let words = if !say.is_empty() {
                     say
                 } else if names.is_empty() {
-                    "Список станций пуст. Назови станцию, и я её найду.".to_string()
-                } else {
+                    if ru { "Список станций пуст. Назови станцию, и я её найду.".to_string() }
+                    else { "No stations saved. Name a station and I'll find it.".to_string() }
+                } else if ru {
                     format!("Доступны: {}. Назови станцию.", names.join(", "))
+                } else {
+                    format!("Available: {}. Name a station.", names.join(", "))
                 };
                 log("[skill] radio -> list favorites");
                 let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
@@ -1957,17 +1973,11 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
                 Some(stream_url) => {
                     log(&format!("[skill] radio -> play \"{query}\" @ {stream_url}"));
                     if start_radio(&stream_url) {
-                        let words =
-                            if say.is_empty() { format!("Включаю {query}.") } else { say };
-                        let pcm = openai_tts(&client, cfg, &persona.voice, &words)?;
-                        Ok(Response { control: CTRL_SPEAKER, pcm })
+                        // Success: just play, no spoken confirmation.
+                        Ok(Response { control: CTRL_SPEAKER, pcm: Vec::new() })
                     } else {
-                        let pcm = openai_tts(
-                            &client,
-                            cfg,
-                            &persona.voice,
-                            "Не удалось запустить радио.",
-                        )?;
+                        let msg = if ru { "Не удалось запустить радио." } else { "Couldn't start the radio." };
+                        let pcm = openai_tts(&client, cfg, &persona.voice, msg)?;
                         Ok(Response { control: CTRL_NONE, pcm })
                     }
                 }
@@ -1975,12 +1985,12 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
                     // No LIVE candidate — don't speak the brain's optimistic "включаю",
                     // and don't enter speaker mode (that would just be silence).
                     log(&format!("[skill] radio -> no live stream for \"{query}\""));
-                    let pcm = openai_tts(
-                        &client,
-                        cfg,
-                        &persona.voice,
-                        "Не нашла рабочую станцию, попробуй другую.",
-                    )?;
+                    let msg = if ru {
+                        "Не нашла рабочую станцию, попробуй другую."
+                    } else {
+                        "Couldn't find a working station, try another."
+                    };
+                    let pcm = openai_tts(&client, cfg, &persona.voice, msg)?;
                     Ok(Response { control: CTRL_NONE, pcm })
                 }
             }

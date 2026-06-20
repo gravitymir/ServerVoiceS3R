@@ -84,9 +84,8 @@ button press uses the default Sophia persona.
 
 Needs `OPENAI_API_KEY` (STT + TTS) and the [`claude` CLI](https://claude.com/claude-code) on `PATH`.
 
-### `windows` — fully local + Claude subscription (no API keys)
-Local **Whisper** (`stt_server.py`, or `STT_ENGINE=sapi` for Windows
-System.Speech) → `claude` CLI reply → **Windows SAPI** TTS.
+### `windows` — local STT/TTS + Claude subscription (no OpenAI key)
+Windows **System.Speech** (STT) → `claude` CLI reply → **Windows SAPI** TTS.
 
 ### `openai` — all-OpenAI
 OpenAI Whisper → Chat Completions → OpenAI TTS.
@@ -252,7 +251,7 @@ per line, `#` comments; real environment variables take precedence.
 | `CODE_DIR` | `C:/Users/gravi/voice-code` | Project folder for voice coding mode (M6) |
 | `TRANSCRIBE_TIMEOUT` | `60` | Seconds of silence before (chunked) transcribe mode auto-exits |
 | `REALTIME_MODEL` | `gpt-4o-transcribe` | OpenAI Realtime transcription model (streaming dictation) |
-| `TYPE_INTO_FOCUS` | unset | Live dictation: paste each phrase (Ctrl+V) into the focused field |
+| `TYPE_INTO_FOCUS` | **on** | Live dictation: paste each transcribed phrase (Ctrl+V) into the focused field. On by default; set `0` to disable. Toggle by voice: "включи/выключи печать в поле". |
 | `REALTIME_SILENCE_MS` | `1500` | Realtime server-VAD silence (ms) before finalizing a phrase |
 | `REALTIME_DEBUG` | unset | If `1`, log every Realtime websocket event |
 | `STT_MODEL` | `whisper-1` | OpenAI transcription model (command recognition) |
