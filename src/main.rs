@@ -2462,7 +2462,8 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
         .collect::<Vec<_>>()
         .join(", ");
     let t = Instant::now();
-    let raw = run_claude(&skills_prompt(&transcript, cur_vol, persona, &favs))?;
+    let compressor_enabled = !cfg.compressor_host.is_empty();
+    let raw = run_claude(&skills_prompt(&transcript, cur_vol, persona, &favs, compressor_enabled))?;
     log(&format!("[llm {:?}] {}", t.elapsed(), raw.replace('\n', " ").trim()));
 
     // Parse the skill decision; fall back to speaking the raw text as an answer.
@@ -2572,6 +2573,16 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
             // 0xFD => device plays this, then listens again immediately (no wake word).
             Ok(Response { control: CTRL_TRANSCRIBE, pcm })
         }
+        "compressor" => {
+            let action = json_str(&raw, "action").trim().to_lowercase();
+            let action = match action.as_str() {
+                "on" | "off" | "toggle" | "status" => action,
+                _ => "status".to_string(),
+            };
+            let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
+            log(&format!("[skill] compressor -> {action}"));
+            compressor_action(&client, cfg, persona, &action, ru)
+        }
         _ => {
             log("[skill] -> answer");
             if say.is_empty() {
@@ -2585,9 +2596,25 @@ fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response>
 
 /// The skill catalogue the Claude brain chooses from. Current volume is included
 /// so it can handle relative requests ("louder", "тише").
-fn skills_prompt(transcript: &str, cur_volume: u8, persona: &Persona, favorites: &str) -> String {
+fn skills_prompt(
+    transcript: &str,
+    cur_volume: u8,
+    persona: &Persona,
+    favorites: &str,
+    compressor: bool,
+) -> String {
     let now_local = chrono::Local::now().format("%A %Y-%m-%d %H:%M %:z");
     let intro = persona.skills_intro;
+    // Offered only when a compressor is configured. The relay is controlled by a
+    // local fast-path too, but the brain catches fuzzy/mixed-language phrasing
+    // (e.g. Whisper hearing "turn on" as Cyrillic "турн он").
+    let compressor_skill = if compressor {
+        "6) Control the COMPRESSOR relay — the user says \"включи/выключи компрессор\", \
+         \"turn on/off the compressor\", \"compressor status/toggle\" (any spelling, RU or EN):\n\
+         {\"skill\":\"compressor\",\"action\":\"on|off|toggle|status\"}\n"
+    } else {
+        ""
+    };
     format!(
         "{intro} You are the brain of a small voice smart-speaker ('ATOM'). The \
          user speaks to it; you decide what it should DO. Current local time: {now_local} (use it \
@@ -2615,7 +2642,8 @@ fn skills_prompt(transcript: &str, cur_volume: u8, persona: &Persona, favorites:
          \"переводи на английский\", \"translate to Spanish\", \"translate mode\"). Set 'target' to the \
          destination language as an ISO-639-1 code (en, ru, es, de, fr, it, uk, pl, pt, zh, ja, ar, …); \
          if no language is named, use \"en\":\n\
-         {{\"skill\":\"translate\",\"target\":\"<iso code>\",\"say\":\"<short confirmation in the user's language, e.g. 'Режим перевода включён, перевожу на английский'>\"}}\n\n\
+         {{\"skill\":\"translate\",\"target\":\"<iso code>\",\"say\":\"<short confirmation in the user's language, e.g. 'Режим перевода включён, перевожу на английский'>\"}}\n\
+         {compressor_skill}\n\
          Rules for 'say': ONE short sentence, in the SAME language the user used (Russian or English); \
          for weather give only the current conditions, never a multi-day forecast unless asked; never \
          include URLs, citations, markdown, lists, or emojis. Output ONLY the JSON object.\n\n\
@@ -2870,34 +2898,40 @@ fn compressor_fast_path(
     };
 
     let ru = transcript.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c));
-    let speak = |words: &str| -> Result<Option<Response>> {
-        Ok(Some(Response {
-            control: CTRL_NONE,
-            pcm: openai_tts(client, cfg, &persona.voice, words)?,
-        }))
-    };
+    Ok(Some(compressor_action(client, cfg, persona, action, ru)?))
+}
 
+/// Run a compressor action (on/off/toggle/status): network gate -> HTTP -> spoken
+/// result (language-matched). Shared by the local fast-path and the brain skill.
+fn compressor_action(
+    client: &reqwest::blocking::Client,
+    cfg: &Config,
+    persona: &Persona,
+    action: &str,
+    ru: bool,
+) -> Result<Response> {
+    let speak = |words: &str| -> Result<Response> {
+        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+    };
     if !on_compressor_network(cfg) {
-        log("[compressor] off-network — skill not available here");
+        log("[compressor] off-network — not available here");
         return speak(if ru {
             "Компрессор доступен только в сети сервиса."
         } else {
             "The compressor is only available on the service network."
         });
     }
-
     log(&format!("[compressor] -> /{action} @ {}", cfg.compressor_host));
     match compressor_request(&cfg.compressor_host, action) {
         Ok(state) => {
             let on = state.trim().eq_ignore_ascii_case("ON");
-            let words = if on {
+            speak(if on {
                 if ru { "Компрессор включён." } else { "Compressor is on." }
             } else if ru {
                 "Компрессор выключен."
             } else {
                 "Compressor is off."
-            };
-            speak(words)
+            })
         }
         Err(e) => {
             log(&format!("[compressor] request failed: {e}"));
