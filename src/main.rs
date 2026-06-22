@@ -85,6 +85,10 @@ static DICTATION_STARTED: std::sync::atomic::AtomicBool =
 /// by single-line fields (e.g. a search box), whereas a synthesized Enter /
 /// Shift+Enter can submit them. Config: DICTATION_METHOD; voice-switchable.
 static DICTATION_METHOD: AtomicU8 = AtomicU8::new(0);
+/// Consecutive silent turns while in a keep-listening mode (chat/translate/etc.).
+/// After enough of them (~60 s) the mode auto-exits so a forgotten or unheard
+/// session doesn't loop forever. Reset to 0 on any real-speech turn.
+static SILENCE_STREAK: AtomicU8 = AtomicU8::new(0);
 
 /// Device→server header bit (OR'd into the persona byte): "button pressed — leave
 /// transcribe mode". The accompanying utterance is empty.
@@ -524,12 +528,12 @@ fn handle(mut stream: TcpStream, cfg: &Config) -> Result<()> {
         HACKER_MODE.store(false, Ordering::Relaxed);
         CODING_MODE.store(false, Ordering::Relaxed);
         CHAT_MODE.store(false, Ordering::Relaxed);
-        log("[exit] button — back to wake-word listening");
-        let pcm = transcribe_off_pcm(cfg, &persona);
+        SILENCE_STREAK.store(0, Ordering::Relaxed);
+        // The button leaves ANY mode and just returns to the home (wake-word)
+        // state — no spoken confirmation (a mode-specific phrase like "transcribe
+        // mode off" was wrong when you were actually in chat/translate/etc.).
+        log("[exit] button — back to wake-word listening (silent)");
         stream.write_all(&[CTRL_NONE]).ok();
-        if !pcm.is_empty() {
-            stream.write_all(&pcm).ok();
-        }
         stream.flush().ok();
         return Ok(());
     }
@@ -1095,6 +1099,43 @@ fn print_transcript(text: &str) {
 fn deliver_transcript(text: &str) {
     let sep = TRANSCRIBE_SEP.load(Ordering::Relaxed);
     let mut text = text.trim().to_string();
+
+    // Voice "enter" command: a phrase ending with "нажать энтер" / "press enter"
+    // (Whisper hears the two-word phrase far more reliably than a lone "enter")
+    // means "type the rest, then press a real Enter" — submit a search / send a
+    // message by voice. Both command words are stripped. A lone trailing
+    // "enter"/"энтер" still works as a fallback (when it IS heard).
+    let press_enter = {
+        let stem = text.trim_end_matches(|c: char| !c.is_alphanumeric());
+        let words: Vec<&str> = stem.split_whitespace().collect();
+        let n = words.len();
+        let is_enter = |w: &str| {
+            let w = w.to_lowercase();
+            w == "enter" || w == "энтер" || w == "ентер"
+        };
+        // Verb before "enter" (may appear without "enter" if Whisper drops it).
+        let is_verb = |w: &str| {
+            matches!(w.to_lowercase().as_str(), "нажать" | "нажми" | "назад" | "press")
+        };
+        // Verb that's safe to treat as the command ON ITS OWN when "enter" was
+        // dropped. NOT "назад" — alone it just means "back".
+        let is_verb_solo = |w: &str| {
+            matches!(w.to_lowercase().as_str(), "нажать" | "нажми" | "press")
+        };
+        if n >= 2 && is_enter(words[n - 1]) && is_verb(words[n - 2]) {
+            text = words[..n - 2].join(" "); // "… нажать энтер" / "… press enter"
+            true
+        } else if n >= 1 && is_enter(words[n - 1]) {
+            text = words[..n - 1].join(" "); // "enter"/"энтер" alone (нажать dropped)
+            true
+        } else if n >= 1 && is_verb_solo(words[n - 1]) {
+            text = words[..n - 1].join(" "); // "нажать"/"press" alone (enter dropped)
+            true
+        } else {
+            false
+        }
+    };
+
     // In newline mode each phrase is its own line, so the period Whisper appends to
     // declarative sentences is just noise — drop a trailing '.' (and ellipsis). Keep
     // '?' and '!' (they carry meaning). In space/joined modes it reads as running
@@ -1105,64 +1146,126 @@ fn deliver_transcript(text: &str) {
         }
         text = text.trim_end().to_string();
     }
-    if text.is_empty() {
+    if text.is_empty() && !press_enter {
         return;
     }
     if TYPE_INTO_FOCUS.load(Ordering::Relaxed) {
-        // First phrase of the session: no leading separator. Every phrase after it
-        // gets the separator in front (newline / space / nothing).
-        let first = !DICTATION_STARTED.swap(true, Ordering::Relaxed);
-        let prefix = if first {
-            ""
-        } else {
-            match sep {
-                1 => "\n", // new line: a literal '\n' for paste, Shift+Enter for type
-                2 => "",   // joined, no separator
-                _ => " ",  // space
+        if press_enter {
+            // Submit. TYPE the text (not clipboard+Ctrl+V) then press Enter, both via
+            // SendInput — the OS keeps input events in call order, so Enter ALWAYS
+            // lands after the typed text. (Ctrl+V is async: the Enter could fire
+            // before the paste committed, which is why it "didn't work the first
+            // time".) No leading separator — a submit is a fresh, discrete entry.
+            if !text.is_empty() {
+                type_into_focus(&text);
+                let _ = copy_to_clipboard(&text); // clipboard backup
             }
-        };
-        let payload = format!("{prefix}{text}");
-        if DICTATION_METHOD.load(Ordering::Relaxed) == 1 {
-            // Native key injection (Win32 SendInput).
-            type_into_focus(&payload);
-            let _ = copy_to_clipboard(&text); // keep clipboard for a manual paste
-        } else {
-            // Clipboard + Ctrl+V (default). A pasted newline doesn't submit
-            // single-line fields, so this is the safest for search boxes.
-            if !paste_into_focus(&payload) {
-                log("[type] paste failed — text left on clipboard, paste manually");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            send_enter();
+            DICTATION_STARTED.store(false, Ordering::Relaxed); // next phrase starts fresh
+            log("[type] voice 'enter' — typed + Enter");
+        } else if !text.is_empty() {
+            // Normal dictation: deliver by the configured method, with the separator.
+            // First phrase of the session: no leading separator; later ones get it.
+            let first = !DICTATION_STARTED.swap(true, Ordering::Relaxed);
+            let prefix = if first {
+                ""
+            } else {
+                match sep {
+                    1 => "\n", // new line: a literal '\n' for paste, Shift+Enter for type
+                    2 => "",   // joined, no separator
+                    _ => " ",  // space
+                }
+            };
+            let payload = format!("{prefix}{text}");
+            if DICTATION_METHOD.load(Ordering::Relaxed) == 1 {
+                // Native key injection (Win32 SendInput).
+                type_into_focus(&payload);
+                let _ = copy_to_clipboard(&text); // keep clipboard for a manual paste
+            } else {
+                // Clipboard + Ctrl+V (default). A pasted newline doesn't submit
+                // single-line fields, so this is the safest for search boxes.
+                if !paste_into_focus(&payload) {
+                    log("[type] paste failed — text left on clipboard, paste manually");
+                }
             }
         }
-    } else {
+    } else if !text.is_empty() {
         copy_to_clipboard(&text);
     }
 }
 
-/// Put `text` on the clipboard AND paste it (Ctrl+V) into the focused window, in
-/// ONE hidden PowerShell call (CREATE_NO_WINDOW so it never flashes a console or
-/// steals focus). A short delay lets the clipboard settle before the keystroke.
-/// Unlike native key injection, a pasted newline is dropped by single-line fields
-/// (e.g. a search box) instead of submitting them. Best-effort; returns success.
+/// Press Enter via native Win32 `SendInput` (VK_RETURN) — submits the focused
+/// field (search box, chat send, form). Layout-independent (virtual-key code).
+fn send_enter() {
+    const INPUT_KEYBOARD: u32 = 1;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const VK_RETURN: u16 = 0x0D;
+    let key = |up: bool| KeyInput {
+        type_: INPUT_KEYBOARD,
+        _align: 0,
+        w_vk: VK_RETURN,
+        w_scan: 0,
+        dw_flags: if up { KEYEVENTF_KEYUP } else { 0 },
+        time: 0,
+        dw_extra_info: 0,
+        _pad: 0,
+    };
+    let inputs = [key(false), key(true)];
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<KeyInput>() as i32,
+        );
+    }
+}
+
+/// Put `text` on the clipboard (UTF-8, Cyrillic-safe) and paste it with a NATIVE
+/// Ctrl+V. We must NOT use PowerShell `SendKeys('^v')`: SendKeys resolves '^v'
+/// through the ACTIVE keyboard layout, and on a non-US layout (e.g. Russian) there
+/// is no 'v' key, so the paste silently fails. Injecting the virtual keys
+/// VK_CONTROL + VK_V via SendInput is layout-independent. A pasted newline is
+/// dropped by single-line fields (search boxes) instead of submitting them.
 fn paste_into_focus(text: &str) -> bool {
-    let tmp = std::env::temp_dir().join("s3r_transcript.txt");
-    if std::fs::write(&tmp, text).is_err() {
+    if !copy_to_clipboard(text) {
         return false;
     }
-    let cmd = format!(
-        "Set-Clipboard -Value (Get-Content -Raw -Encoding UTF8 -LiteralPath '{}'); \
-         Add-Type -AssemblyName System.Windows.Forms; \
-         Start-Sleep -Milliseconds 40; \
-         [System.Windows.Forms.SendKeys]::SendWait('^v')",
-        tmp.display()
-    );
-    Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &cmd])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    std::thread::sleep(std::time::Duration::from_millis(30)); // let the clipboard settle
+    send_ctrl_v();
+    true
+}
+
+/// Press Ctrl+V via native Win32 `SendInput` using virtual-key codes — works on
+/// any keyboard layout (unlike PowerShell SendKeys '^v', which fails on RU/non-US).
+fn send_ctrl_v() {
+    const INPUT_KEYBOARD: u32 = 1;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const VK_CONTROL: u16 = 0x11;
+    const VK_V: u16 = 0x56;
+    let key = |vk: u16, up: bool| KeyInput {
+        type_: INPUT_KEYBOARD,
+        _align: 0,
+        w_vk: vk,
+        w_scan: 0,
+        dw_flags: if up { KEYEVENTF_KEYUP } else { 0 },
+        time: 0,
+        dw_extra_info: 0,
+        _pad: 0,
+    };
+    let inputs = [
+        key(VK_CONTROL, false), // Ctrl down
+        key(VK_V, false),       // V down
+        key(VK_V, true),        // V up
+        key(VK_CONTROL, true),  // Ctrl up
+    ];
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<KeyInput>() as i32,
+        );
+    }
 }
 
 /// One synthesized keyboard event (Win32 `INPUT`, keyboard variant; 40 bytes on x64).
@@ -1272,18 +1375,32 @@ fn is_meaningful_transcript(t: &str) -> bool {
     if has_foreign_script(t) {
         return false;
     }
+    // Fragments (not whole phrases) so variants match too, e.g. "for watching"
+    // catches "thanks for watching" / "thank you so much for watching".
     const JUNK: &[&str] = &[
-        "ご視聴ありがとうございました",
         "продолжение следует",
-        "субтитры сделал",
-        "субтитры создавал",
+        "субтитры",          // "субтитры сделал/создавал", "редактор субтитров"
         "спасибо за просмотр",
-        "thanks for watching",
-        "thank you for watching",
-        "please subscribe",
+        "for watching",      // thank(s) [so much] for watching
+        "subscribe",
+        "subtitles",
     ];
     let low = t.to_lowercase();
     !JUNK.iter().any(|j| low.contains(j))
+}
+
+/// True if the 16-bit PCM holds enough speech-level energy to be worth
+/// transcribing. On near-silence Whisper hallucinates text (foreign phrases,
+/// "thanks for watching"), which in a keep-listening mode makes the assistant
+/// reply to nothing — so we skip transcription entirely when it's basically quiet.
+fn pcm_has_speech(pcm: &[u8]) -> bool {
+    const SPEECH_PEAK: i32 = 350; // same quiet floor the firmware uses
+    const MIN_LOUD_SAMPLES: usize = 1500; // ~0.1s of speech-level audio at 16 kHz
+    let loud = pcm
+        .chunks_exact(2)
+        .filter(|s| (i16::from_le_bytes([s[0], s[1]]) as i32).abs() > SPEECH_PEAK)
+        .count();
+    loud >= MIN_LOUD_SAMPLES
 }
 
 // ───────────────────── Streaming transcribe (port 9002) ─────────────────────
@@ -1973,9 +2090,10 @@ fn is_chat_enter(t: &str) -> bool {
     t.contains("режим разговор")
         || t.contains("режим бесед")
         || t.contains("режим чат")
-        || t.contains("давай поговор")
-        || t.contains("давай поболта")
-        || t.contains("поболтаем")
+        || t.contains("поговор") // давай/хочу поговорить, поговорим
+        || t.contains("поболта") // поболтаем, поболтать
+        || t.contains("побеседуем")
+        || t.contains("попизд") // попиздим, попиздеть (slang)
         || t.contains("chat mode")
         || t.contains("let's chat")
         || t.contains("let's talk")
@@ -1983,15 +2101,24 @@ fn is_chat_enter(t: &str) -> bool {
 
 fn is_chat_exit(t: &str) -> bool {
     let t = t.to_lowercase();
-    t.contains("выйти из разговор")
+    // Explicit "leave chat" forms.
+    let explicit = t.contains("выйти из разговор")
         || t.contains("выйти из бесед")
         || t.contains("выйти из чат")
-        || t.contains("закончить разговор")
-        || t.contains("закончить бесед")
-        || t.contains("стоп разговор")
         || t.contains("exit chat")
         || t.contains("stop chat")
         || t.contains("leave chat")
+        || t.contains("end chat")
+        || t.contains("до свидания")
+        || t.contains("goodbye");
+    // "end / stop the conversation" — a stop-word together with a talk-word, so it
+    // catches "заканчиваем разговор", "хватит болтать", "закончим беседу", etc.
+    let stop = t.contains("закончи") || t.contains("заканчива") || t.contains("заверши")
+        || t.contains("хватит") || t.contains("стоп") || t.contains("прекрат")
+        || t.contains("конец");
+    let talk = t.contains("разгов") || t.contains("бесед") || t.contains("болта")
+        || t.contains("чат") || t.contains("общ");
+    explicit || (stop && talk)
 }
 
 /// If a chat-mode toggle, or we're already in chat mode, handle it and return the
@@ -2224,6 +2351,38 @@ fn openai_brain(pcm: &[u8], cfg: &Config) -> Result<Response> {
 
 fn skills_brain(pcm: &[u8], cfg: &Config, persona: &Persona) -> Result<Response> {
     let client = reqwest::blocking::Client::new();
+
+    // Silence guard: don't transcribe near-silence. After a pause the device sends
+    // a few seconds of quiet, and Whisper invents text on it ("thanks for
+    // watching", random foreign phrases) — in a keep-listening mode the assistant
+    // then "replies to nothing". Skip transcription and just keep the current mode.
+    if !pcm_has_speech(pcm) {
+        let keep = CHAT_MODE.load(Ordering::Relaxed)
+            || TRANSLATE_MODE.load(Ordering::Relaxed)
+            || HACKER_MODE.load(Ordering::Relaxed)
+            || CODING_MODE.load(Ordering::Relaxed)
+            || TRANSCRIBE_MODE.load(Ordering::Relaxed);
+        if keep {
+            // Auto-leave after a long run of pure silence (~15 turns ≈ 60 s) so a
+            // forgotten / not-heard session doesn't loop forever. Button also exits.
+            let streak = SILENCE_STREAK.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            if streak >= 15 {
+                SILENCE_STREAK.store(0, Ordering::Relaxed);
+                CHAT_MODE.store(false, Ordering::Relaxed);
+                TRANSLATE_MODE.store(false, Ordering::Relaxed);
+                HACKER_MODE.store(false, Ordering::Relaxed);
+                CODING_MODE.store(false, Ordering::Relaxed);
+                TRANSCRIBE_MODE.store(false, Ordering::Relaxed);
+                log("[idle] ~60s of silence — leaving keep-listening mode (back to wake word)");
+                return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
+            }
+            log("[skip] no speech energy — ignoring (silence/noise)");
+            return Ok(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() });
+        }
+        log("[skip] no speech energy — ignoring (silence/noise)");
+        return Ok(Response { control: CTRL_NONE, pcm: Vec::new() });
+    }
+    SILENCE_STREAK.store(0, Ordering::Relaxed); // a real-speech turn resets the idle counter
 
     let t = Instant::now();
     let wav = pcm_to_wav(pcm, DEVICE_RATE);
