@@ -1910,13 +1910,22 @@ fn is_coding_enter(t: &str) -> bool {
 
 fn is_coding_exit(t: &str) -> bool {
     let t = t.to_lowercase();
-    t.contains("exit coding")
-        || t.contains("stop coding")
-        || t.contains("leave coding")
-        || t.contains("выйти из программ")
-        || t.contains("закончить программ")
-        || t.contains("стоп кодинг")
-        || t.contains("выйти из кодинг")
+    // A stop word together with a coding-mode word. "программир" matches the mode
+    // name (программирование/-ия) but NOT a command about "программа/программу".
+    let stop = t.contains("выйти")
+        || t.contains("выйди")
+        || t.contains("выход")
+        || t.contains("закончи")
+        || t.contains("заверши")
+        || t.contains("стоп")
+        || t.contains("выключи")
+        || t.contains("exit")
+        || t.contains("stop")
+        || t.contains("leave")
+        || t.contains("end")
+        || t.contains("quit");
+    let ctx = t.contains("программир") || t.contains("кодинг") || t.contains("coding");
+    stop && ctx
 }
 
 /// If the transcript is a coding-mode toggle, or we're already in coding mode,
@@ -1928,12 +1937,12 @@ fn coding_mode_step(
     persona: &Persona,
     transcript: &str,
 ) -> Result<Option<Response>> {
+    // Coding mode is BUTTON-PER-COMMAND: every reply uses CTRL_NONE so the device
+    // goes back to idle and waits for a button press (or wake word) for the next
+    // command — no auto-listen loop (which would record silence/noise during the
+    // long pauses while Claude thinks). CODING_MODE stays on until "exit" / reset.
     let speak = |words: &str| -> Result<Response> {
         Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
-    };
-    // Like `speak`, but 0xFD => the device listens again immediately (no wake word).
-    let speak_keep = |words: &str| -> Result<Response> {
-        Ok(Response { control: CTRL_TRANSCRIBE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
     };
 
     if CODING_MODE.load(Ordering::Relaxed) {
@@ -1942,9 +1951,9 @@ fn coding_mode_step(
             log("[coding] exit");
             return Ok(Some(speak("Exited coding mode.")?));
         }
-        // Silence/junk hallucination -> keep listening, don't run a Claude turn.
+        // Silence/junk -> say nothing, stay in coding mode (device is idle anyway).
         if !is_meaningful_transcript(transcript) {
-            return Ok(Some(Response { control: CTRL_TRANSCRIBE, pcm: Vec::new() }));
+            return Ok(Some(Response { control: CTRL_NONE, pcm: Vec::new() }));
         }
         // Route the spoken command to the persistent Claude Code session.
         let continue_session = CODING_STARTED.swap(true, Ordering::Relaxed);
@@ -1957,14 +1966,14 @@ fn coding_mode_step(
         log(&format!("[coding {:?}] {}", t.elapsed(), reply.replace('\n', " ").trim()));
         let say = clean_for_speech(&reply);
         let say = if say.is_empty() { "Done.".to_string() } else { say };
-        return Ok(Some(speak_keep(&say)?));
+        return Ok(Some(speak(&say)?));
     }
 
     if is_coding_enter(transcript) {
         CODING_MODE.store(true, Ordering::Relaxed);
         CODING_STARTED.store(false, Ordering::Relaxed); // next command starts a fresh session
         log(&format!("[coding] enter ({})", cfg.code_dir));
-        return Ok(Some(speak_keep("Coding mode on. What should I build?")?));
+        return Ok(Some(speak("Coding mode on. Press the button for each command.")?));
     }
 
     Ok(None)
