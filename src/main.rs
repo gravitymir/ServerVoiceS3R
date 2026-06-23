@@ -106,6 +106,10 @@ const CTRL_TRANSCRIBE: u8 = 0xFD;
 /// server segments + transcribes it. LOCAL = on-PC Whisper, EXTERNAL = OpenAI.
 const CTRL_STREAM_LOCAL: u8 = 0xFC;
 const CTRL_STREAM_EXTERNAL: u8 = 0xFB;
+/// Coding mode: device idles like CTRL_NONE (button-per-command), but uses a longer
+/// trailing-silence tail so the user can pause mid-command. Sent for every coding
+/// reply; CTRL_NONE on exit resets the device to the normal tail.
+const CTRL_CODING: u8 = 0xFA;
 /// Port the device streams the mic to for streaming transcription.
 const TRANSCRIBE_STREAM_PORT: u16 = 9002;
 
@@ -1937,23 +1941,24 @@ fn coding_mode_step(
     persona: &Persona,
     transcript: &str,
 ) -> Result<Option<Response>> {
-    // Coding mode is BUTTON-PER-COMMAND: every reply uses CTRL_NONE so the device
-    // goes back to idle and waits for a button press (or wake word) for the next
-    // command — no auto-listen loop (which would record silence/noise during the
-    // long pauses while Claude thinks). CODING_MODE stays on until "exit" / reset.
+    // Coding mode is BUTTON-PER-COMMAND: replies use CTRL_CODING (0xFA) so the device
+    // idles and waits for a button press for the next command — but with a longer
+    // silence tail so the user can pause mid-command. Exit uses CTRL_NONE to reset
+    // the tail. CODING_MODE stays sticky on the server until exit / reset.
     let speak = |words: &str| -> Result<Response> {
-        Ok(Response { control: CTRL_NONE, pcm: openai_tts(client, cfg, &persona.voice, words)? })
+        Ok(Response { control: CTRL_CODING, pcm: openai_tts(client, cfg, &persona.voice, words)? })
     };
 
     if CODING_MODE.load(Ordering::Relaxed) {
         if is_coding_exit(transcript) {
             CODING_MODE.store(false, Ordering::Relaxed);
             log("[coding] exit");
-            return Ok(Some(speak("Exited coding mode.")?));
+            let pcm = openai_tts(client, cfg, &persona.voice, "Exited coding mode.")?;
+            return Ok(Some(Response { control: CTRL_NONE, pcm }));
         }
-        // Silence/junk -> say nothing, stay in coding mode (device is idle anyway).
+        // Silence/junk -> say nothing, stay in coding mode (keep the long tail).
         if !is_meaningful_transcript(transcript) {
-            return Ok(Some(Response { control: CTRL_NONE, pcm: Vec::new() }));
+            return Ok(Some(Response { control: CTRL_CODING, pcm: Vec::new() }));
         }
         // Route the spoken command to the persistent Claude Code session.
         let continue_session = CODING_STARTED.swap(true, Ordering::Relaxed);
