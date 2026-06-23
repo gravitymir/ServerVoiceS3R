@@ -2032,49 +2032,69 @@ fn claude_exec(args: &[&str], dir: &str, prompt: &str) -> Result<String> {
         .write_all(prompt.as_bytes())?; // dropped here -> closes stdin (EOF)
 
     let stdout = child.stdout.take().context("claude stdout")?;
-    let reader = std::io::BufReader::new(stdout);
-    let mut final_text = String::new();
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match v["type"].as_str() {
-            Some("assistant") => {
-                if let Some(blocks) = v["message"]["content"].as_array() {
-                    for b in blocks {
-                        match b["type"].as_str() {
-                            Some("text") => {
-                                let t = b["text"].as_str().unwrap_or("").trim();
-                                if !t.is_empty() {
-                                    log(&format!("    · {t}"));
+
+    // Parse Claude's stream-json on a thread, accumulating the final 'result' text.
+    // We deliberately do NOT wait for the stdout pipe to hit EOF: if the session
+    // launched a long-running process (e.g. `cargo run` of a dev server), that
+    // grandchild inherits the pipe and never closes it, so reading to EOF would
+    // block forever — and the device would sit stuck on its "thinking" cue. Instead
+    // we wait on the claude PROCESS below and take whatever the reader has by then.
+    let final_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let ft = final_text.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            match v["type"].as_str() {
+                Some("assistant") => {
+                    if let Some(blocks) = v["message"]["content"].as_array() {
+                        for b in blocks {
+                            match b["type"].as_str() {
+                                Some("text") => {
+                                    let t = b["text"].as_str().unwrap_or("").trim();
+                                    if !t.is_empty() {
+                                        log(&format!("    · {t}"));
+                                    }
                                 }
+                                Some("tool_use") => {
+                                    log(&format!(
+                                        "    ⚙ {}",
+                                        tool_summary(b["name"].as_str().unwrap_or("?"), &b["input"])
+                                    ));
+                                }
+                                _ => {}
                             }
-                            Some("tool_use") => {
-                                log(&format!(
-                                    "    ⚙ {}",
-                                    tool_summary(b["name"].as_str().unwrap_or("?"), &b["input"])
-                                ));
-                            }
-                            _ => {}
                         }
                     }
                 }
-            }
-            Some("result") => {
-                if let Some(r) = v["result"].as_str() {
-                    final_text = r.to_string();
+                Some("result") => {
+                    if let Some(r) = v["result"].as_str() {
+                        *ft.lock().unwrap() = r.to_string();
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
-    }
+    });
+
+    // Wait for the claude process itself to finish, then give the reader a moment
+    // to surface the final 'result' line (bounded — don't hang if it never comes).
     let _ = child.wait();
-    Ok(final_text)
+    for _ in 0..40 {
+        if !final_text.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = final_text.lock().unwrap().clone();
+    Ok(text)
 }
 
 // ── Chat mode ("just talk") ──────────────────────────────────────────────────
